@@ -228,27 +228,56 @@ print_iface(){
 }
 
 choose_iface_manual(){
-    local title="$1" exclude="${2:-}"; shift 2 || true
-    local arr=() i n
+    local title="$1"
+    local exclude="${2:-}"
+    local arr=()
+    local i n idx chosen
+
     mapfile -t arr < <(detect_interfaces)
-    echo -e "${BOLD}${title}${NC}"; echo
+
+    echo -e "${BOLD}${title}${NC}" >&2
+    echo >&2
+
     n=1
+
     for i in "${arr[@]}"; do
         [[ "$i" == "$exclude" ]] && continue
-        echo "  ${n}) $(print_iface "$i")"
-        echo
+
+        echo -n "  ${n}) " >&2
+        print_iface "$i" >&2
+        echo >&2
+
         ((n++))
     done
+
     while true; do
         read -rp "Ваш выбор: " n
-        [[ "$n" =~ ^[0-9]+$ ]] || { warn "Введите номер."; continue; }
-        local idx=0 chosen=""
+
+        [[ "$n" =~ ^[0-9]+$ ]] || {
+            warn "Введите номер." >&2
+            continue
+        }
+
+        idx=0
+        chosen=""
+
         for i in "${arr[@]}"; do
             [[ "$i" == "$exclude" ]] && continue
-            ((idx++)); [[ "$idx" == "$n" ]] && chosen="$i" && break
+
+            ((idx++))
+
+            if [[ "$idx" == "$n" ]]; then
+                chosen="$i"
+                break
+            fi
         done
-        [[ -n "$chosen" ]] && echo "$chosen" && return 0
-        warn "Нет такого пункта."
+
+        if [[ -n "$chosen" ]]; then
+            echo "$chosen"
+            return 0
+        fi
+
+        warn "Нет такого пункта." >&2
     done
 }
 
@@ -779,10 +808,20 @@ quick_status(){
 
 network_is_ready(){
     [[ -f "$NETPLAN_FILE" ]] || return 1
-    ip -4 addr show dev lan 2>/dev/null | grep -q "inet ${LAN_IP}/24" || return 1
+
+    # Проверяем только наличие и корректность базовой конфигурации.
+    # Физический carrier LAN не обязателен:
+    # во время установки пользователь может быть подключён только к WAN.
+    grep -q 'set-name: lan' "$NETPLAN_FILE" || return 1
+    grep -q 'set-name: wan' "$NETPLAN_FILE" || return 1
+
+    grep -q "192.168.100.1/24" "$NETPLAN_FILE" || return 1
+
+    # Интерфейсы должны существовать после применения Netplan.
+    ip link show lan >/dev/null 2>&1 || return 1
     ip link show wan >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet dnsmasq 2>/dev/null || return 1
-    grep -q "dhcp-range=${DHCP_START},${DHCP_END}" "$DNSMASQ_FILE" 2>/dev/null || return 1
+
+    return 0
 }
 
 full_diagnostics(){
@@ -1187,9 +1226,16 @@ main(){
     self_test
     check_os
     mkdir -p "$STATE_DIR"
-    if ! network_is_ready; then
+
+    # Первоначальная настройка запускается только если
+    # конфигурации Netplan ещё нет.
+    if [[ ! -f "$NETPLAN_FILE" ]]; then
         configure_network_first
+    else
+        info "Существующая конфигурация сети обнаружена."
+        info "Первоначальная настройка интерфейсов не требуется."
     fi
+
     load_config || true
     main_menu
 }
