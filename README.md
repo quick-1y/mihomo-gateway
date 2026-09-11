@@ -1,8 +1,6 @@
 # Ubuntu Gateway + Mihomo
 
-Интерактивный установщик шлюза на Ubuntu/Debian, который превращает мини-ПК с двумя сетевыми портами в сетевой gateway с Mihomo.
-
-Скрипт рассчитан на работу **без монитора и клавиатуры**: установить, переустановить, настроить и удалить Gateway можно удалённо через SSH.
+Интерактивный установщик шлюза на Ubuntu/Debian, который превращает мини-комп с двумя сетевыми портами в сетевой gateway с Mihomo.
 
 ---
 
@@ -11,29 +9,33 @@
 Схема работы:
 
 ```text
-                    ИНТЕРНЕТ
-                        │
-                        │ WAN
-                        ▼
-              ┌───────────────────┐
-              │     Ubuntu PC     │
-              │                   │
-              │  WAN      LAN     │
-              │   │        │      │
-              │   │        │      │
-              │   │   Mihomo      │
-              │   │   Docker      │
-              │   │      │        │
-              └───┼──────┼────────┘
-                  │      │
-                 WAN    LAN
-                         │
-                         ▼
-                     Switch / AP
-                         │
-             ┌───────────┼───────────┐
-             │           │           │
-            PC        Wi-Fi       Камеры
+         ИНТЕРНЕТ
+            │
+            │ WAN
+            ▼
+ ┌──────────────────────┐
+ │      Ubuntu          │
+ │                      │
+ │  wan → Интернет      │
+ │  lan → 192.168.100.1 │
+ │  Meta → Mihomo TUN   │
+ │                      │
+ │  dnsmasq             │
+ │  nftables            │
+ │  Mihomo              │
+ └──────────┬───────────┘
+            │
+            │ LAN
+            ▼
+      192.168.100.0/24
+            │
+            │
+            ▼
+       Switch / AP
+            │
+┌───────────┼───────────┐
+│           │           │
+PC        Wi-Fi       Камеры
 ```
 
 На Ubuntu остаются системные сетевые функции:
@@ -102,38 +104,29 @@
 
 Установку можно выполнить полностью через SSH.
 
-Подключитесь к мини-ПК:
+Подключитесь к мини-компьютеру:
 
 ```bash
 ssh user@IP_АДРЕС
 ```
 
-Например:
-
-```bash
-ssh user@192.168.1.245
-```
-
 После подключения скачайте установщик.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USERNAME/REPOSITORY/main/install-gateway.sh -o install-gateway.sh
+curl -fsSL https://github.com/quick-1y/mihomo-gatway/blob/main/install-gateway-docker.sh -o install-gateway-docker.sh
 ```
 
 Сделайте его исполняемым:
 
 ```bash
-chmod +x install-gateway.sh
+chmod +x install-gateway-docker.sh
 ```
 
 Запустите:
 
 ```bash
-sudo ./install-gateway.sh
+sudo ./install-gateway-docker.sh
 ```
-
-> Замените `USERNAME/REPOSITORY` на адрес вашего GitHub-репозитория.
-
 ---
 
 # Первый запуск
