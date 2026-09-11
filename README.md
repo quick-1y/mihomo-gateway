@@ -46,7 +46,11 @@
 
 ```bash
 curl -fsSL -o install-gateway-docker.sh https://raw.githubusercontent.com/quick-1y/mihomo-gateway/main/install-gateway-docker.sh
+```
+```bash
 chmod +x install-gateway-docker.sh
+```
+```bash
 sudo ./install-gateway-docker.sh
 ```
 
