@@ -498,6 +498,30 @@ EOF2
 # ----------------------------------------------------------------------------
 # NAT / nftables
 # ----------------------------------------------------------------------------
+
+configure_nftables(){
+    header "УСТАНОВКА · NFTABLES"
+
+    require_cmd nft
+
+    write_nftables
+
+    if ! nft -c -f "$NFT_FILE"; then
+        error "Ошибка синтаксиса $NFT_FILE"
+        return 1
+    fi
+
+    systemctl enable nftables >/dev/null 2>&1 || true
+    systemctl restart nftables
+
+    if systemctl is-active --quiet nftables; then
+        success "nftables → active"
+    else
+        error "nftables не запущен"
+        return 1
+    fi
+}
+
 write_nftables(){
     if [[ "$NAT_ENABLED" == "1" ]]; then
         cat > "$NFT_FILE" <<EOF2
