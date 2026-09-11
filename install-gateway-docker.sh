@@ -65,6 +65,10 @@ header(){ echo; echo -e "${BOLD}${CYAN}╔════════════�
 confirm(){ local a; read -rp "$(echo -e "${YELLOW}${1:-Продолжить?} [y/N]: ${NC}")" a; [[ "$a" =~ ^[YyДд]$ ]]; }
 press_enter(){ read -rp "Нажмите Enter..." _ || true; }
 need_root(){ [[ $EUID -eq 0 ]] || { error "Запустите: sudo bash $0"; exit 1; }; }
+die(){
+    error "$*"
+    exit 1
+}
 
 on_error(){
     local rc=$?
@@ -77,46 +81,84 @@ trap on_error ERR
 # ----------------------------------------------------------------------------
 # Timed command runner
 # ----------------------------------------------------------------------------
+
 run_timed(){
     local label="$1"; shift
     local log
     log=$(mktemp /tmp/mgw-run.XXXXXX)
-    local start=$SECONDS pid rc elapsed
+
+    local start=$SECONDS
+    local pid
+    local rc
+    local elapsed
+
     "$@" >"$log" 2>&1 &
     pid=$!
+
     while kill -0 "$pid" 2>/dev/null; do
         elapsed=$((SECONDS-start))
         printf '\r%s⏳%s %-48s %3ss' "$YELLOW" "$NC" "$label" "$elapsed"
         sleep 1
     done
-    wait "$pid"; rc=$?
+
+    if wait "$pid"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
     elapsed=$((SECONDS-start))
     printf '\r\033[2K'
+
     if (( rc == 0 )); then
         success "$label — ${elapsed} с"
     else
         error "$label — ошибка (код ${rc}, ${elapsed} с)"
         tail -n 30 "$log" >&2 || true
     fi
+
     rm -f "$log"
     return "$rc"
 }
 
 run_capture(){
     local label="$1"; shift
-    local log; log=$(mktemp /tmp/mgw-run.XXXXXX)
-    local start=$SECONDS pid rc elapsed
-    "$@" >"$log" 2>&1 & pid=$!
+    local log
+    log=$(mktemp /tmp/mgw-run.XXXXXX)
+
+    local start=$SECONDS
+    local pid
+    local rc
+    local elapsed
+
+    "$@" >"$log" 2>&1 &
+    pid=$!
+
     while kill -0 "$pid" 2>/dev/null; do
         elapsed=$((SECONDS-start))
         printf '\r%s⏳%s %-48s %3ss' "$YELLOW" "$NC" "$label" "$elapsed"
         sleep 1
     done
-    wait "$pid"; rc=$?
-    elapsed=$((SECONDS-start)); printf '\r\033[2K'
-    if (( rc == 0 )); then success "$label — ${elapsed} с"; else error "$label — ошибка"; tail -n 40 "$log" >&2 || true; fi
+
+    if wait "$pid"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    elapsed=$((SECONDS-start))
+    printf '\r\033[2K'
+
+    if (( rc == 0 )); then
+        success "$label — ${elapsed} с"
+    else
+        error "$label — ошибка"
+        tail -n 40 "$log" >&2 || true
+    fi
+
     cat "$log" >/tmp/mgw-last.log
     rm -f "$log"
+
     return "$rc"
 }
 
@@ -247,7 +289,7 @@ choose_iface_manual(){
         print_iface "$i" >&2
         echo >&2
 
-        ((n++))
+        n=$((n + 1))
     done
 
     while true; do
@@ -264,7 +306,7 @@ choose_iface_manual(){
         for i in "${arr[@]}"; do
             [[ "$i" == "$exclude" ]] && continue
 
-            ((idx++))
+            idx=$((idx + 1))
 
             if [[ "$idx" == "$n" ]]; then
                 chosen="$i"
@@ -329,8 +371,11 @@ apply_netplan_checked(){
     netplan generate
     netplan apply
     sleep 3
-    ip -4 addr show dev lan 2>/dev/null | grep -q "inet ${LAN_IP}/24" || return 1
+
+    ip link show lan >/dev/null 2>&1 || return 1
     ip link show wan >/dev/null 2>&1 || return 1
+
+    return 0
 }
 
 configure_network_first(){
@@ -390,17 +435,22 @@ configure_network_first(){
 # ----------------------------------------------------------------------------
 # dnsmasq
 # ----------------------------------------------------------------------------
+
 configure_dnsmasq(){
     header "УСТАНОВКА · DHCP / DNSMASQ"
-    [[ -f "$DNSMASQ_FILE" && ! -f "$ORIGINAL_DNSMASQ" ]] && cp -a "$DNSMASQ_FILE" "$ORIGINAL_DNSMASQ" || true
+
+    [[ -f "$DNSMASQ_FILE" && ! -f "$ORIGINAL_DNSMASQ" ]] &&
+        cp -a "$DNSMASQ_FILE" "$ORIGINAL_DNSMASQ" || true
+
     if ! dpkg-query -W -f='${Status}' dnsmasq 2>/dev/null | grep -q 'install ok installed'; then
         apt_install dnsmasq
     else
         success "dnsmasq уже установлен."
     fi
+
     cat > "$DNSMASQ_FILE" <<EOF2
 interface=lan
-bind-interfaces
+bind-dynamic
 
 dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,12h
 
@@ -413,20 +463,34 @@ bogus-priv
 server=${DNS1}
 server=${DNS2}
 EOF2
+
     mkdir -p "$(dirname "$DNSMASQ_OVERRIDE")"
+
     cat > "$DNSMASQ_OVERRIDE" <<'EOF2'
 [Unit]
 Wants=network-online.target
+After=systemd-networkd.service
 After=network-online.target
 After=sys-subsystem-net-devices-lan.device
+
+[Service]
+Restart=on-failure
+RestartSec=2
 EOF2
+
     systemctl daemon-reload
     systemctl enable dnsmasq >/dev/null 2>&1 || true
+
     if ! run_timed "Запуск dnsmasq" systemctl restart dnsmasq; then
         journalctl -u dnsmasq -n 40 --no-pager || true
         return 1
     fi
-    systemctl is-active --quiet dnsmasq || { error "dnsmasq не active."; return 1; }
+
+    systemctl is-active --quiet dnsmasq || {
+        error "dnsmasq не active."
+        return 1
+    }
+
     success "DHCP → ${DHCP_START}–${DHCP_END}"
     success "Gateway/DNS → ${LAN_IP}"
 }
@@ -440,9 +504,30 @@ write_nftables(){
 #!/usr/sbin/nft -f
 
 table inet gateway_filter {
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        # Уже установленные соединения
+        ct state established,related accept
+
+        # Loopback
+        iifname "lo" accept
+
+        # LAN management/services
+        iifname "lan" tcp dport { 80, 9090, 7890 } accept
+
+        # WAN: management/services are NOT accessible
+        iifname "wan" tcp dport { 80, 9090, 7890 } drop
+    }
+
     chain forward {
         type filter hook forward priority filter; policy accept;
+
+        # LAN → Internet
         iifname "lan" oifname "wan" accept
+
+        # Return traffic
         iifname "wan" oifname "lan" ct state established,related accept
     }
 }
@@ -450,33 +535,35 @@ table inet gateway_filter {
 table ip gateway_nat {
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
+
         oifname "wan" ip saddr ${LAN_IP%.*}.0/24 masquerade
     }
 }
 EOF2
     else
-        cat > "$NFT_FILE" <<'EOF2'
+        cat > "$NFT_FILE" <<EOF2
 #!/usr/sbin/nft -f
 
 table inet gateway_filter {
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        ct state established,related accept
+        iifname "lo" accept
+
+        iifname "lan" tcp dport { 80, 9090, 7890 } accept
+        iifname "wan" tcp dport { 80, 9090, 7890 } drop
+    }
+
     chain forward {
         type filter hook forward priority filter; policy accept;
     }
 }
 EOF2
     fi
-    chmod 644 "$NFT_FILE"
-}
 
-configure_nftables(){
-    header "УСТАНОВКА · NFTABLES / NAT"
-    if ! command -v nft >/dev/null 2>&1; then apt_install nftables; else success "nftables уже установлен."; fi
-    [[ -f "$NFT_FILE" && ! -f "$ORIGINAL_NFT" ]] && cp -a "$NFT_FILE" "$ORIGINAL_NFT" || true
-    write_nftables
-    nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables."; return 1; }
-    success "Конфигурация nftables — OK"
-    systemctl enable nftables >/dev/null 2>&1 || true
-    run_timed "Применение nftables" nft -f "$NFT_FILE"
+    chmod 644 "$NFT_FILE"
 }
 
 # ----------------------------------------------------------------------------
@@ -768,11 +855,14 @@ EOF2
 
 create_env(){
     mkdir -p "$PROJECT_DIR"
-    [[ -f "$ENV_FILE" ]] || cat > "$ENV_FILE" <<EOF2
+
+    cat > "$ENV_FILE" <<EOF2
 TZ=Europe/Moscow
 DEFAULT_BACKEND_URL=http://${LAN_IP}:9090
 EOF2
+
     chmod 600 "$ENV_FILE"
+    success "Docker environment → ${ENV_FILE}"
 }
 
 validate_config(){
@@ -793,17 +883,74 @@ check_ui(){ curl -fsS --max-time 3 "http://${LAN_IP}/" >/dev/null 2>&1; }
 check_tun(){ ip link show Meta >/dev/null 2>&1 || ip link show meta >/dev/null 2>&1; }
 check_container(){ docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null | grep -qx running; }
 
+check_lan_link(){
+    [[ -n "$LAN_IFACE" ]] || return 1
+    carrier_of "$LAN_IFACE"
+}
+
+check_lan_ip(){
+    ip -4 addr show dev "${LAN_IFACE:-lan}" 2>/dev/null |
+        grep -q "inet ${LAN_IP}/24"
+}
+
+check_wan_ip(){
+    ip -4 addr show dev "${WAN_IFACE:-wan}" 2>/dev/null |
+        grep -q 'inet '
+}
+
 quick_status(){
     load_config || true
+
     echo -e "${BOLD}Состояние:${NC}"
-    network_is_ready && echo -e "  Сеть          $(service_dot ok)" || echo -e "  Сеть          $(service_dot FAIL)"
-    systemctl is-active --quiet dnsmasq 2>/dev/null && echo -e "  DHCP          $(service_dot ok)" || echo -e "  DHCP          $(service_dot FAIL)"
-    [[ -f "$NFT_FILE" ]] && nft list table ip gateway_nat >/dev/null 2>&1  && echo -e "  NAT           $(service_dot ok)" || echo -e "  NAT           $(service_dot OFF)"
-    systemctl is-active --quiet docker 2>/dev/null && echo -e "  Docker        $(service_dot ok)" || echo -e "  Docker        $(service_dot FAIL)"
-    check_container mihomo && echo -e "  Mihomo        $(service_dot ok)" || echo -e "  Mihomo        $(service_dot FAIL)"
-    check_container metacubexd && echo -e "  MetaCubeXD    $(service_dot ok)" || echo -e "  MetaCubeXD    $(service_dot FAIL)"
-    check_api && echo -e "  API :9090     $(service_dot ok)" || echo -e "  API :9090     $(service_dot FAIL)"
-    check_ui && echo -e "  Панель :80    $(service_dot ok)" || echo -e "  Панель :80    $(service_dot FAIL)"
+
+    if network_is_ready; then
+        echo -e "  Конфигурация $(service_dot ok)"
+    else
+        echo -e "  Конфигурация $(service_dot FAIL)"
+    fi
+
+    if check_lan_ip; then
+        if check_lan_link; then
+            echo -e "  LAN           $(service_dot ok)"
+        else
+            echo -e "  LAN           ${YELLOW}●${NC} подключение отсутствует"
+        fi
+    else
+        echo -e "  LAN           ${RED}●${NC} адрес отсутствует"
+    fi
+
+    check_wan_ip &&
+        echo -e "  WAN           $(service_dot ok)" ||
+        echo -e "  WAN           $(service_dot FAIL)"
+
+    systemctl is-active --quiet dnsmasq 2>/dev/null &&
+        echo -e "  DHCP          $(service_dot ok)" ||
+        echo -e "  DHCP          $(service_dot FAIL)"
+
+    [[ -f "$NFT_FILE" ]] &&
+    nft list table ip gateway_nat >/dev/null 2>&1 &&
+        echo -e "  NAT           $(service_dot ok)" ||
+        echo -e "  NAT           $(service_dot OFF)"
+
+    systemctl is-active --quiet docker 2>/dev/null &&
+        echo -e "  Docker        $(service_dot ok)" ||
+        echo -e "  Docker        $(service_dot FAIL)"
+
+    check_container mihomo &&
+        echo -e "  Mihomo        $(service_dot ok)" ||
+        echo -e "  Mihomo        $(service_dot FAIL)"
+
+    check_container metacubexd &&
+        echo -e "  MetaCubeXD    $(service_dot ok)" ||
+        echo -e "  MetaCubeXD    $(service_dot FAIL)"
+
+    check_api &&
+        echo -e "  API :9090     $(service_dot ok)" ||
+        echo -e "  API :9090     $(service_dot FAIL)"
+
+    check_ui &&
+        echo -e "  Панель :80    $(service_dot ok)" ||
+        echo -e "  Панель :80    $(service_dot FAIL)"
 }
 
 network_is_ready(){
@@ -1024,11 +1171,17 @@ settings_menu(){
 # ----------------------------------------------------------------------------
 install_stack(){
     header "УСТАНОВКА GATEWAY + MIHOMO"
+
+    load_config || {
+        error "Не найдена сохранённая конфигурация Gateway."
+        error "Сначала выполните первоначальную настройку сети."
+        return 1
+    }
+
     configure_forwarding
     configure_nftables
     install_docker
 
-    load_config || true
     mkdir -p "$PROJECT_DIR" "$MIHOMO_CONFIG_DIR/ruleset" "$MIHOMO_CONFIG_DIR/proxy_providers"
 
     prompt_secret
