@@ -1056,7 +1056,6 @@ prompt_secret(){
         CLASH_SECRET="$a"
 
         break
-    }
 
     write_config
 
