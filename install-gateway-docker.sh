@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Ubuntu Gateway + Mihomo — Docker Manager v3.0
+# Ubuntu Gateway + Mihomo — Docker Manager
 #
 # HOST:
 #   Netplan
@@ -27,7 +27,6 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.0.0"
 readonly STATE_DIR="/var/lib/mihomo-gateway"
 readonly CONFIG_FILE="${STATE_DIR}/gateway.env"
 readonly ORIGINAL_DIR="${STATE_DIR}/original"
@@ -124,11 +123,28 @@ run_capture(){
 # ----------------------------------------------------------------------------
 # OS / packages
 # ----------------------------------------------------------------------------
+get_os_release_value(){
+    local key="$1"
+    local value
+
+    value=$(grep -E "^[[:space:]]*${key}=" /etc/os-release 2>/dev/null | head -n1 | sed -E 's/^[^=]+=//' || true)
+    value="${value#\"}"
+    value="${value%\"}"
+    printf '%s' "$value"
+}
+
 check_os(){
     [[ -f /etc/os-release ]] || { error "Не найден /etc/os-release"; exit 1; }
-    . /etc/os-release
-    info "ОС: ${PRETTY_NAME:-unknown}"
-    if [[ "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *ubuntu* && "${ID_LIKE:-}" != *debian* ]]; then
+
+    local os_id os_id_like os_pretty
+
+    os_id="$(get_os_release_value ID)"
+    os_id_like="$(get_os_release_value ID_LIKE)"
+    os_pretty="$(get_os_release_value PRETTY_NAME)"
+
+    info "ОС: ${os_pretty:-unknown}"
+
+    if [[ "$os_id" != "ubuntu" && "$os_id_like" != *ubuntu* && "$os_id_like" != *debian* ]]; then
         warn "Скрипт рассчитан на Ubuntu/Debian."
         confirm "Продолжить?" || exit 1
     fi
@@ -464,9 +480,9 @@ configure_docker_repo(){
         run_timed "Загрузка ключа Docker" curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
     fi
-    . /etc/os-release
     local arch codename
-    arch=$(dpkg --print-architecture); codename="${VERSION_CODENAME:-}"
+    arch=$(dpkg --print-architecture)
+    codename="$(get_os_release_value VERSION_CODENAME)"
     [[ -n "$codename" ]] || { error "Не удалось определить VERSION_CODENAME."; return 1; }
     cat > /etc/apt/sources.list.d/docker.sources <<EOF2
 Types: deb
@@ -744,4 +760,438 @@ check_api(){
     [[ -n "$CLASH_SECRET" ]] || return 1
     curl -fsS --max-time 3 -H "Authorization: Bearer ${CLASH_SECRET}" "http://${LAN_IP}:9090/version" >/dev/null 2>&1
 }
-check_ui(){ curl -fsS --max-time 3 "http://${LAN_IP}/" >/dev/null 
+check_ui(){ curl -fsS --max-time 3 "http://${LAN_IP}/" >/dev/null 2>&1; }
+check_tun(){ ip link show Meta >/dev/null 2>&1 || ip link show meta >/dev/null 2>&1; }
+check_container(){ docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null | grep -qx running; }
+
+quick_status(){
+    load_config || true
+    echo -e "${BOLD}Состояние:${NC}"
+    network_is_ready && echo -e "  Сеть          $(service_dot ok)" || echo -e "  Сеть          $(service_dot FAIL)"
+    systemctl is-active --quiet dnsmasq 2>/dev/null && echo -e "  DHCP          $(service_dot ok)" || echo -e "  DHCP          $(service_dot FAIL)"
+    [[ -f "$NFT_FILE" ]] && nft list table ip gateway_nat >/dev/null 2>&1  && echo -e "  NAT           $(service_dot ok)" || echo -e "  NAT           $(service_dot OFF)"
+    systemctl is-active --quiet docker 2>/dev/null && echo -e "  Docker        $(service_dot ok)" || echo -e "  Docker        $(service_dot FAIL)"
+    check_container mihomo && echo -e "  Mihomo        $(service_dot ok)" || echo -e "  Mihomo        $(service_dot FAIL)"
+    check_container metacubexd && echo -e "  MetaCubeXD    $(service_dot ok)" || echo -e "  MetaCubeXD    $(service_dot FAIL)"
+    check_api && echo -e "  API :9090     $(service_dot ok)" || echo -e "  API :9090     $(service_dot FAIL)"
+    check_ui && echo -e "  Панель :80    $(service_dot ok)" || echo -e "  Панель :80    $(service_dot FAIL)"
+}
+
+network_is_ready(){
+    [[ -f "$NETPLAN_FILE" ]] || return 1
+    ip -4 addr show dev lan 2>/dev/null | grep -q "inet ${LAN_IP}/24" || return 1
+    ip link show wan >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet dnsmasq 2>/dev/null || return 1
+    grep -q "dhcp-range=${DHCP_START},${DHCP_END}" "$DNSMASQ_FILE" 2>/dev/null || return 1
+}
+
+full_diagnostics(){
+    header "ПОЛНАЯ ДИАГНОСТИКА / СТАТУСЫ"
+    load_config || true
+    echo -e "${BOLD}СЕТЬ${NC}"
+    echo "  LAN интерфейс: ${LAN_IFACE:-unknown}"
+    echo "  LAN адрес:     ${LAN_IP}/24"
+    echo "  WAN интерфейс: ${WAN_IFACE:-unknown}"
+    echo "  DHCP:          ${DHCP_START}–${DHCP_END}"
+    echo "  DNS upstream:  ${DNS1}, ${DNS2}"
+    echo
+    ip -br addr show lan 2>/dev/null || true
+    ip -br addr show wan 2>/dev/null || true
+    echo
+    echo -e "${BOLD}СЕРВИСЫ ХОСТА${NC}"
+    systemctl is-active --quiet dnsmasq && echo -e "  dnsmasq        ${GREEN}active${NC}" || echo -e "  dnsmasq        ${RED}inactive${NC}"
+    systemctl is-active --quiet nftables && echo -e "  nftables       ${GREEN}active${NC}" || echo -e "  nftables       ${RED}inactive${NC}"
+    systemctl is-active --quiet docker && echo -e "  docker         ${GREEN}active${NC}" || echo -e "  docker         ${RED}inactive${NC}"
+    echo
+    echo -e "${BOLD}DOCKER${NC}"
+    docker --version 2>/dev/null || echo "  Engine: отсутствует"
+    docker compose version 2>/dev/null || echo "  Compose: отсутствует"
+    echo
+    echo -e "${BOLD}КОНТЕЙНЕРЫ${NC}"
+    for c in mihomo metacubexd; do
+        local st; st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo not-found)
+        echo "  ${c}: ${st}"
+    done
+    echo
+    echo -e "${BOLD}MIHOMO${NC}"
+    echo "  API:        http://${LAN_IP}:9090"
+    echo "  Proxy:      ${LAN_IP}:7890"
+    echo "  TUN:        $([[ $(check_tun) ]] && echo active || echo not found)"
+    check_api && echo -e "  API check:  ${GREEN}OK${NC}" || echo -e "  API check:  ${RED}FAIL${NC}"
+    echo
+    echo -e "${BOLD}ПАНЕЛЬ${NC}"
+    echo "  URL:        http://${LAN_IP}/"
+    check_ui && echo -e "  HTTP check: ${GREEN}OK${NC}" || echo -e "  HTTP check: ${RED}FAIL${NC}"
+    echo
+    echo -e "${BOLD}DHCP${NC}"
+    echo "  Range:      ${DHCP_START}–${DHCP_END}"
+    echo "  Gateway:    ${LAN_IP}"
+    echo "  DNS:        ${LAN_IP}"
+    echo
+    echo -e "${BOLD}NAT${NC}"
+    if [[ "$NAT_ENABLED" == 1 ]]; then echo -e "  Состояние:  ${GREEN}включён${NC}"; else echo -e "  Состояние:  ${YELLOW}выключен${NC}"; fi
+    echo "  LAN → WAN:  ${LAN_IP%.*}.0/24 → ${WAN_IFACE:-wan}"
+}
+
+# ----------------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------------
+restart_stack(){
+    ( cd "$PROJECT_DIR" && docker compose up -d --remove-orphans )
+}
+
+apply_generated(){
+    write_config
+    write_netplan
+    netplan generate
+    write_nftables
+    nft -c -f "$NFT_FILE"
+    if ! run_timed "Применение nftables" nft -f "$NFT_FILE"; then return 1; fi
+    if ! run_timed "Применение Netplan" apply_netplan_checked; then return 1; fi
+    configure_dnsmasq
+    render_mihomo_config
+    ( cd "$PROJECT_DIR" && docker compose up -d --remove-orphans )
+}
+
+subscription_menu(){
+    while true; do
+        header "НАСТРОЙКИ · ПОДПИСКА MIHOMO"
+        if [[ -n "$SUBSCRIPTION_URL" ]]; then echo "Текущая: ${SUBSCRIPTION_URL:0:80}"; else echo "Текущая: не задана"; fi
+        echo
+        echo "  1) Добавить / изменить ссылку"
+        echo "  2) Проверить доступность"
+        echo "  3) Удалить подписку"
+        echo "  4) Назад"
+        echo
+        local c; read -rp "Выбор [1-4]: " c
+        case "$c" in
+          1) prompt_subscription_install; [[ -n "$SUBSCRIPTION_URL" ]] && { render_mihomo_config; restart_stack; } ;;
+          2) [[ -n "$SUBSCRIPTION_URL" ]] && curl -fsSL --max-time 10 -o /dev/null "$SUBSCRIPTION_URL" && success "Подписка доступна." || error "Подписка недоступна." ;;
+          3) if confirm "Удалить ссылку подписки?"; then SUBSCRIPTION_URL=""; write_config; warn "Подписка удалена. Для запуска Mihomo нужна новая подписка."; fi ;;
+          4) return ;;
+          *) warn "Неверный выбор." ;;
+        esac
+        press_enter
+    done
+}
+
+password_menu(){
+    prompt_secret
+    if [[ -f "$MIHOMO_CONFIG" && -n "$SUBSCRIPTION_URL" ]]; then render_mihomo_config; ( cd "$PROJECT_DIR" && docker compose up -d mihomo ); fi
+    press_enter
+}
+
+lan_menu(){
+    header "НАСТРОЙКИ · LAN"
+    echo "Текущий LAN: ${LAN_IP}/24"
+    echo "Gateway и DNS для DHCP: ${LAN_IP}"
+    echo
+    echo "При изменении LAN изменятся также DHCP, NAT и Mihomo API."
+    warn "Изменение LAN разорвёт SSH."
+    echo
+    local new_ip
+    read -rp "Новый LAN IP [${LAN_IP}]: " new_ip
+    [[ -z "$new_ip" ]] && return
+    [[ "$new_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { error "Некорректный IPv4."; return; }
+    local o="$LAN_IP"; LAN_IP="$new_ip"
+    echo; echo "Изменения: ${o} → ${LAN_IP}"; echo "DHCP gateway/DNS → ${LAN_IP}"; echo "Mihomo API → http://${LAN_IP}:9090"; echo
+    warn "После применения текущая SSH-сессия может оборваться."
+    if confirm "Применить новую LAN-конфигурацию?"; then
+        if apply_generated; then success "LAN изменён. Переподключитесь к ssh user@${LAN_IP}"; else LAN_IP="$o"; write_config; warn "Изменение LAN не применено полностью."; fi
+    else LAN_IP="$o"; fi
+}
+
+dhcp_menu(){
+    header "НАСТРОЙКИ · DHCP"
+    echo "Текущий диапазон: ${DHCP_START}–${DHCP_END}"
+    echo "Gateway/DNS: ${LAN_IP}"
+    echo
+    local a b
+    read -rp "Начало DHCP [${DHCP_START}]: " a
+    read -rp "Конец DHCP [${DHCP_END}]: " b
+    [[ -n "$a" ]] && DHCP_START="$a"; [[ -n "$b" ]] && DHCP_END="$b"
+    if configure_dnsmasq; then write_config; success "DHCP сохранён."; else error "Не удалось применить DHCP."; fi
+}
+
+nat_menu(){
+    while true; do
+        header "НАСТРОЙКИ · NAT"
+        echo "LAN: ${LAN_IP%.*}.0/24 → WAN: ${WAN_IFACE:-wan}"
+        if [[ "$NAT_ENABLED" == 1 ]]; then echo -e "Состояние: ${GREEN}ВКЛЮЧЁН${NC}"; else echo -e "Состояние: ${YELLOW}ВЫКЛЮЧЕН${NC}"; fi
+        echo
+        echo "  1) Включить NAT"
+        echo "  2) Выключить NAT"
+        echo "  3) Пересоздать правила"
+        echo "  4) Назад"
+        echo
+        local c; read -rp "Выбор [1-4]: " c
+        case "$c" in
+          1) NAT_ENABLED=1; write_nftables; nft -c -f "$NFT_FILE" && nft -f "$NFT_FILE" && write_config && success "NAT включён." ;;
+          2) NAT_ENABLED=0; write_nftables; nft -c -f "$NFT_FILE" && nft -f "$NFT_FILE" && write_config && success "NAT выключен." ;;
+          3) write_nftables; nft -c -f "$NFT_FILE" && nft -f "$NFT_FILE" && success "Правила NAT пересозданы." ;;
+          4) return ;;
+          *) warn "Неверный выбор." ;;
+        esac
+        press_enter
+    done
+}
+
+interfaces_menu(){
+    header "НАСТРОЙКИ · ИНТЕРФЕЙСЫ"
+    echo "Текущие: LAN=${LAN_IFACE} (${LAN_MAC}), WAN=${WAN_IFACE} (${WAN_MAC})"; echo
+    echo "1) Изменить LAN интерфейс"; echo "2) Изменить WAN интерфейс"; echo "3) Назад"; echo
+    local c; read -rp "Выбор [1-3]: " c
+    local new
+    case "$c" in
+      1) new=$(choose_iface_manual "Выберите новый LAN" "$WAN_IFACE")
+         LAN_IFACE="$new"; LAN_MAC=$(mac_of "$new");
+         if confirm "Применить? SSH может оборваться."; then apply_generated || true; else load_config; fi ;;
+      2) new=$(choose_iface_manual "Выберите новый WAN" "$LAN_IFACE")
+         WAN_IFACE="$new"; WAN_MAC=$(mac_of "$new");
+         if confirm "Применить?"; then apply_generated || true; else load_config; fi ;;
+      3) return ;;
+    esac
+}
+
+dns_menu(){
+    header "НАСТРОЙКИ · DNS UPSTREAM"
+    echo "Текущие: ${DNS1}, ${DNS2}"; echo
+    read -rp "DNS 1 [${DNS1}]: " a; read -rp "DNS 2 [${DNS2}]: " b
+    [[ -n "$a" ]] && DNS1="$a"; [[ -n "$b" ]] && DNS2="$b"
+    configure_dnsmasq && write_config && success "DNS upstream сохранён." || true
+}
+
+settings_menu(){
+    while true; do
+        header "НАСТРОЙКИ"
+        echo "  1) Подписка Mihomo"
+        echo "  2) Пароль Mihomo API"
+        echo "  3) LAN / адрес шлюза"
+        echo "  4) DHCP / пул адресов"
+        echo "  5) NAT"
+        echo "  6) Интерфейсы LAN / WAN"
+        echo "  7) DNS upstream"
+        echo "  8) Назад"
+        echo
+        local c; read -rp "Выбор [1-8]: " c
+        case "$c" in
+          1) subscription_menu;; 2) password_menu;; 3) lan_menu;; 4) dhcp_menu;; 5) nat_menu;; 6) interfaces_menu;; 7) dns_menu;; 8) return;; *) warn "Неверный выбор.";;
+        esac
+    done
+}
+
+# ----------------------------------------------------------------------------
+# Install / remove
+# ----------------------------------------------------------------------------
+install_stack(){
+    header "УСТАНОВКА GATEWAY + MIHOMO"
+    configure_forwarding
+    configure_nftables
+    install_docker
+
+    load_config || true
+    mkdir -p "$PROJECT_DIR" "$MIHOMO_CONFIG_DIR/ruleset" "$MIHOMO_CONFIG_DIR/proxy_providers"
+
+    prompt_secret
+    prompt_subscription_install
+    render_mihomo_config
+    create_env
+    create_compose
+
+    header "ЗАГРУЗКА DOCKER-ОБРАЗОВ"
+    ( cd "$PROJECT_DIR" && run_timed "Загрузка Docker-образов" docker compose pull )
+
+    validate_config
+
+    header "ЗАПУСК КОНТЕЙНЕРОВ"
+    run_timed "Запуск Mihomo + MetaCubeXD" bash -c "cd '$PROJECT_DIR' && docker compose up -d --remove-orphans"
+    sleep 3
+    check_container mihomo && success "Mihomo → running" || { error "Mihomo не запущен."; docker logs --tail 60 mihomo || true; return 1; }
+    check_container metacubexd && success "MetaCubeXD → running" || { error "MetaCubeXD не запущен."; docker logs --tail 60 metacubexd || true; return 1; }
+    sleep 2
+    check_api && success "Mihomo API → доступен" || warn "Mihomo API пока не отвечает."
+    check_ui && success "Панель → доступна" || warn "Панель пока не отвечает."
+    final_success
+}
+
+final_success(){
+    echo; echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"; echo -e "${GREEN}${BOLD}║                 УСТАНОВКА ЗАВЕРШЕНА                        ║${NC}"; echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"; echo
+    echo -e "  Панель: ${CYAN}${BOLD}http://${LAN_IP}/${NC}"
+    echo -e "  Mihomo API: ${CYAN}${BOLD}http://${LAN_IP}:9090${NC}"
+    echo -e "  Proxy: ${CYAN}${BOLD}${LAN_IP}:7890${NC}"
+    echo; echo "  В MetaCubeXD используйте:"; echo "    Backend URL: http://${LAN_IP}:9090"; echo "    Secret: пароль, введённый при установке"; echo
+}
+
+remove_stack(){
+    header "УДАЛЕНИЕ GATEWAY + MIHOMO"
+    echo "Будут удалены контейнеры и ${PROJECT_DIR}."
+    echo "Будут сохранены: Netplan, dnsmasq, DHCP, nftables, forwarding, Docker Engine."
+    echo
+    confirm "Продолжить обычное удаление?" || return
+    if command -v docker >/dev/null 2>&1 && [[ -f "$COMPOSE_FILE" ]]; then
+        ( cd "$PROJECT_DIR" && docker compose down --remove-orphans --rmi local ) || true
+    else
+        docker rm -f mihomo metacubexd >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PROJECT_DIR"
+    if [[ -f "$CONFIG_FILE" ]]; then sed -i '/^CLASH_SECRET=/d;/^SUBSCRIPTION_URL=/d' "$CONFIG_FILE" || true; fi
+    success "Gateway + Mihomo удалены."
+    echo "Сеть оставлена рабочей. Docker Engine сохранён."
+}
+
+restore_original_netplan(){
+    local f base
+    rm -f "$NETPLAN_FILE"
+    shopt -s nullglob
+    for f in /etc/netplan/*.yaml.gateway-disabled; do
+        mv "$f" "${f%.gateway-disabled}"
+    done
+    shopt -u nullglob
+    if [[ -d "$ORIGINAL_NETPLAN_DIR" ]]; then
+        for f in "$ORIGINAL_NETPLAN_DIR"/*.yaml; do
+            [[ -f "$f" ]] || continue
+            base=$(basename "$f")
+            cp -a "$f" "/etc/netplan/${base}"
+        done
+    fi
+}
+
+full_remove(){
+    header "ПОЛНОЕ УДАЛЕНИЕ И СБРОС СЕТИ"
+    echo -e "${RED}${BOLD}ВНИМАНИЕ!${NC} Это полностью удалит программную часть Gateway и сбросит сеть."
+    echo
+    echo "Будут удалены/сброшены:"
+    echo "  • Mihomo"
+    echo "  • MetaCubeXD"
+    echo "  • Docker Engine и связанные пакеты"
+    echo "  • nftables"
+    echo "  • IPv4 forwarding"
+    echo "  • dnsmasq / DHCP"
+    echo "  • Gateway-Netplan 01-gateway.yaml"
+    echo "  • будут восстановлены исходные Netplan-файлы"
+    echo
+    warn "После применения Netplan сеть может отключиться, SSH будет разорван, устройство может стать недоступным."
+    echo
+    echo -e "Для подтверждения введите: ${BOLD}RESET-GATEWAY${NC}"
+    local token; read -rp "> " token
+    [[ "$token" == RESET-GATEWAY ]] || { warn "Отменено."; return; }
+    echo
+    warn "Последующее применение сети может оборвать текущую SSH-сессию."
+    confirm "Начать полное удаление?" || return
+
+    if command -v docker >/dev/null 2>&1 && [[ -f "$COMPOSE_FILE" ]]; then ( cd "$PROJECT_DIR" && docker compose down --remove-orphans --rmi local ) || true; fi
+    docker rm -f mihomo metacubexd >/dev/null 2>&1 || true
+    rm -rf "$PROJECT_DIR"
+
+    # Docker
+    if dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q 'install ok installed' || command -v docker >/dev/null 2>&1; then
+        run_timed "Удаление Docker Engine" env DEBIAN_FRONTEND=noninteractive apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras || true
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources /etc/apt/keyrings/docker.asc
+    rm -rf /var/lib/docker /var/lib/containerd
+
+    # Host network stack
+    systemctl stop dnsmasq 2>/dev/null || true
+    systemctl disable dnsmasq 2>/dev/null || true
+    if dpkg-query -W -f='${Status}' dnsmasq 2>/dev/null | grep -q 'install ok installed'; then run_timed "Удаление dnsmasq" env DEBIAN_FRONTEND=noninteractive apt-get purge -y dnsmasq || true; fi
+    rm -rf /etc/systemd/system/dnsmasq.service.d
+    systemctl daemon-reload
+
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet gateway_filter 2>/dev/null || true
+        nft delete table ip gateway_nat 2>/dev/null || true
+    fi
+    if dpkg-query -W -f='${Status}' nftables 2>/dev/null | grep -q 'install ok installed'; then run_timed "Удаление nftables" env DEBIAN_FRONTEND=noninteractive apt-get purge -y nftables || true; fi
+
+    rm -f "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+
+    restore_original_netplan
+    netplan generate || true
+
+    echo
+    echo -e "${RED}${BOLD}Сетевая конфигурация будет применена сейчас.${NC}"
+    echo -e "${YELLOW}SSH может оборваться. После сброса устройство может быть доступно только через локальный доступ/консоль или исходную сеть.${NC}"
+    echo
+    confirm "Применить восстановленный Netplan?" || {
+        warn "Netplan восстановлен на диске, но НЕ применён."
+        success "Полное удаление завершено без применения сети."
+        return
+    }
+    netplan apply || true
+    rm -rf "$STATE_DIR"
+    echo; success "Полное удаление завершено."
+    echo "Если SSH оборвался — это ожидаемо."
+}
+
+# ----------------------------------------------------------------------------
+# Self test
+# ----------------------------------------------------------------------------
+self_test(){
+    local missing=()
+    local cmd
+
+    for cmd in bash grep sed awk ip systemctl; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        die "Не найдены обязательные команды: ${missing[*]}"
+    fi
+
+    # Prevent the /etc/os-release readonly-variable bug from returning.
+
+    success "Самопроверка скрипта — OK"
+}
+
+# ----------------------------------------------------------------------------
+# Main menu
+# ----------------------------------------------------------------------------
+main_menu(){
+    while true; do
+        clear
+        load_config || true
+        echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${BOLD}${CYAN}║                UBUNTU GATEWAY + MIHOMO                          ║${NC}"
+        echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${BOLD}${CYAN}║${NC} ${DIM}Состояние системы${NC}                                         ${BOLD}${CYAN}║${NC}"
+        quick_status | sed 's/^/  /'
+        echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  1) Установить / переустановить Gateway                     ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  2) Удалить Gateway (сеть оставить)                         ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  3) Полное удаление + сброс сети                            ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  4) Полная диагностика / статусы                           ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  5) Настройки                                                ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}║${NC}  6) Выход                                                    ${BOLD}${CYAN}║${NC}"
+        echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo
+        echo -e "  ${DIM}Панель: http://${LAN_IP}/${NC}"
+        echo -e "  ${DIM}API:    http://${LAN_IP}:9090${NC}"
+        echo
+        local c; read -rp "Выбор [1-6]: " c
+        case "$c" in
+          1) install_stack; press_enter;;
+          2) remove_stack; press_enter;;
+          3) full_remove; press_enter;;
+          4) clear; full_diagnostics; press_enter;;
+          5) settings_menu;;
+          6) exit 0;;
+          *) warn "Неверный выбор."; sleep 1;;
+        esac
+    done
+}
+
+main(){
+    need_root
+    self_test
+    check_os
+    mkdir -p "$STATE_DIR"
+    if ! network_is_ready; then
+        configure_network_first
+    fi
+    load_config || true
+    main_menu
+}
+
+main "$@"
