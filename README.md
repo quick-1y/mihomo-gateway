@@ -113,7 +113,7 @@ ssh user@IP_АДРЕС
 После подключения скачайте установщик.
 
 ```bash
-curl -fsSL https://github.com/quick-1y/mihomo-gatway/blob/main/install-gateway-docker.sh -o install-gateway-docker.sh
+curl -fsSL -o install-gateway-docker.sh https://raw.githubusercontent.com/quick-1y/mihomo-gateway/main/install-gateway-docker.sh
 ```
 
 Сделайте его исполняемым:
