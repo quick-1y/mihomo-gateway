@@ -45,9 +45,9 @@
 ## 🚀 Быстрый старт
 
 ```bash
-git clone https://github.com/quick-1y/mihomo-gateway.git
-cd mihomo-gateway
-sudo bash install-gateway-docker.sh
+curl -fsSL -o install-gateway-docker.sh https://raw.githubusercontent.com/quick-1y/mihomo-gateway/main/install-gateway-docker.sh
+chmod +x install-gateway-docker.sh
+sudo ./install-gateway-docker.sh
 ```
 
 Всё остальное — интерактивно 🎛
