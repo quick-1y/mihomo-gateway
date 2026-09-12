@@ -338,6 +338,16 @@ backup_once(){
     chmod 700 "$ORIGINAL_DIR"
     if [[ ! -f "${ORIGINAL_DIR}/BACKUP_DONE" ]]; then
         local found=0 f base
+
+        # Реактивировать чужие .gateway-disabled (остались от неудачного удаления)
+        shopt -s nullglob
+        for f in /etc/netplan/*.yaml.gateway-disabled; do
+            [[ "$f" == "${NETPLAN_FILE}.gateway-disabled" ]] && continue
+            warn "Возвращаю в активное состояние: $(basename "$f")"
+            mv -f "$f" "${f%.gateway-disabled}"
+        done
+        shopt -u nullglob
+
         shopt -s nullglob
         for f in /etc/netplan/*.yaml; do
             found=1; base=$(basename "$f"); cp -a "$f" "${ORIGINAL_NETPLAN_DIR}/${base}"
@@ -354,6 +364,7 @@ backup_once(){
 
 write_netplan(){
     mkdir -p /etc/netplan
+    rm -f "${NETPLAN_FILE}.gateway-disabled"
     cat > "$NETPLAN_FILE" <<EOF2
 network:
   version: 2
@@ -1009,7 +1020,11 @@ full_diagnostics(){
     echo -e "${BOLD}MIHOMO${NC}"
     echo "  API:        http://${LAN_IP}:9090"
     echo "  Proxy:      ${LAN_IP}:7890"
-    echo "  TUN:        $([[ $(check_tun) ]] && echo active || echo not found)"
+    if check_tun; then
+        echo -e "  TUN:        ${GREEN}active${NC}"
+    else
+        echo -e "  TUN:        ${RED}not found${NC}"
+    fi
     if [[ -z "$CLASH_SECRET" ]]; then
         echo -e "  API check:  ${YELLOW}SKIP (нет пароля)${NC}"
     else
@@ -1347,15 +1362,26 @@ remove_stack(){
 restore_original_netplan(){
     local f base
 
-    rm -f "$NETPLAN_FILE"
+    # 1) Отключить наш gateway-netplan (mv, не rm — обратимо)
+    if [[ -f "$NETPLAN_FILE" ]]; then
+        mv -f "$NETPLAN_FILE" "${NETPLAN_FILE}.gateway-disabled"
+    fi
 
+    # 2) Включить дефолтные netplan-файлы (кроме нашего собственного)
     shopt -s nullglob
     for f in /etc/netplan/*.yaml.gateway-disabled; do
-        mv "$f" "${f%.gateway-disabled}"
+        [[ "$f" == "${NETPLAN_FILE}.gateway-disabled" ]] && continue
+        mv -f "$f" "${f%.gateway-disabled}"
     done
     shopt -u nullglob
 
-    if [[ -d "$ORIGINAL_NETPLAN_DIR" ]]; then
+    # 3) Если активных не осталось — из бэкапа
+    local have_active=0
+    shopt -s nullglob
+    for f in /etc/netplan/*.yaml; do have_active=1; break; done
+    shopt -u nullglob
+
+    if (( have_active == 0 )) && [[ -d "$ORIGINAL_NETPLAN_DIR" ]]; then
         for f in "$ORIGINAL_NETPLAN_DIR"/*.yaml; do
             [[ -f "$f" ]] || continue
             base=$(basename "$f")
@@ -1363,6 +1389,7 @@ restore_original_netplan(){
         done
     fi
 
+    # 4) Снять netplan-сгенерированные .link / udev
     rm -f /run/systemd/network/*-netplan-*.link 2>/dev/null || true
     rm -f /run/udev/rules.d/*-netplan-*.rules 2>/dev/null || true
     rm -f /etc/systemd/network/*-netplan-*.link 2>/dev/null || true
@@ -1447,7 +1474,9 @@ full_remove(){
         success "Полное удаление завершено без применения сети."
         return
     }
+    systemctl restart systemd-networkd || true
     netplan apply || true
+    rm -f "${NETPLAN_FILE}.gateway-disabled"
     rm -rf "$STATE_DIR"
     echo; success "Полное удаление завершено."
 
