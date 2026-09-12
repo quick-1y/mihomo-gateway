@@ -59,9 +59,6 @@ sudo ./install-gateway-docker.sh
 ```text
 mihomo-gateway/
 ├── install-gateway-docker.sh
-├── gateway.conf
-├── mihomo.yaml.template
-├── compose.yaml.template
 ├── README.md
 └── LICENSE
 ```
