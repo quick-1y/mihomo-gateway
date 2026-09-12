@@ -6,38 +6,42 @@
 
 ## 🗺 Схема работы
 
-```text
-        Интернет 🌍
-            │
-            │  WAN (eth0 / enp1s0)
-            ▼
-   ┌─────────────────────────┐
-   │   Ubuntu Gateway Box    │
-   │  ┌───────────────────┐  │
-   │  │  nftables (NAT)   │  │
-   │  │  dnsmasq (DHCP)   │  │
-   │  └─────────┬─────────┘  │
-   │            │            │
-   │     ┌──────▼──────┐     │
-   │     │   Docker    │     │
-   │     │  ┌───────┐  │     │
-   │     │  │Mihomo │  │     │
-   │     │  └───┬───┘  │     │
-   │     │  ┌───▼────┐ │     │
-   │     │  │MetaCube│ │     │
-   │     │  │  XD 🎛 │ │     │
-   │     │  └────────┘ │     │
-   │     └─────────────┘     │
-   └────────────┬────────────┘
-                │  LAN (eth1 / enp2s0)
-                ▼
-        ┌───────────────┐
-        │  Switch / AP  │
-        └───────┬───────┘
-                │
-      ┌─────────┼─────────┐
-      ▼         ▼         ▼
-   💻 PC     📱 Phone   🖥 Server
+```mermaid
+flowchart TB
+    Internet(["🌍 Интернет"])
+
+    subgraph GW["🖥️ Ubuntu Gateway Box"]
+        direction TB
+        NFT["nftables (NAT)"]
+        DNS["dnsmasq (DHCP)"]
+
+        subgraph DK["🐳 Docker"]
+            direction TB
+            MH["Mihomo"]
+            MC["MetaCubeX 🎛"]
+            MH --> MC
+        end
+
+        NFT --> DNS
+        DNS --> DK
+    end
+
+    SW["🔀 Switch / AP"]
+
+    PC["💻 PC"]
+    PH["📱 Phone"]
+    SRV["🖥️ Server"]
+
+    Internet -- "WAN (eth0 / enp1s0)" --> GW
+    GW -- "LAN (eth1 / enp2s0)" --> SW
+    SW --> PC
+    SW --> PH
+    SW --> SRV
+
+    classDef box fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
+    classDef net fill:#0f172a,stroke:#34d399,color:#e5e7eb;
+    class GW,DK,NFT,DNS,MH,MC,SW,PC,PH,SRV box;
+    class Internet net;
 ```
 
 ---
