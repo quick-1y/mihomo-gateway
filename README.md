@@ -7,35 +7,41 @@
 ## 🗺 Схема работы
 
 ```mermaid
-flowchart LR
-    I(["🌍 Интернет"]):::wan
+flowchart TB
+    Internet(["🌍 Интернет"])
 
-    subgraph GW["Ubuntu Gateway"]
+    subgraph GW["🖥️ Ubuntu Gateway Box"]
         direction TB
-        N["nftables · NAT"]:::svc
-        D["dnsmasq · DHCP"]:::svc
-        subgraph DOCK["Docker"]
-            M1["Mihomo"]:::svc
-            M2["MetaCubeX 🎛"]:::svc
-            M1 --> M2
+        NFT["nftables (NAT)"]
+        DNS["dnsmasq (DHCP)"]
+
+        subgraph DK["🐳 Docker"]
+            direction TB
+            MH["Mihomo"]
+            MC["MetaCubeX 🎛"]
+            MH --> MC
         end
-        N --> D --> DOCK
+
+        NFT --> DNS
+        DNS --> DK
     end
 
-    SW["🔀 Switch / AP"]:::lan
-    PC["💻 PC"]:::lan
-    PH["📱 Phone"]:::lan
-    SRV["🖥️ Server"]:::lan
+    SW["🔀 Switch / AP"]
 
-    I ==>|WAN eth0/enp1s0| GW
-    GW ==>|LAN eth1/enp2s0| SW
+    PC["💻 PC"]
+    PH["📱 Phone"]
+    SRV["🖥️ Server"]
+
+    Internet -- "WAN (eth0 / enp1s0)" --> GW
+    GW -- "LAN (eth1 / enp2s0)" --> SW
     SW --> PC
     SW --> PH
     SW --> SRV
 
-    classDef wan fill:#111827,stroke:#f59e0b,color:#fde68a;
-    classDef svc fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
-    classDef lan fill:#0b1220,stroke:#34d399,color:#a7f3d0;
+    classDef box fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
+    classDef net fill:#0f172a,stroke:#34d399,color:#e5e7eb;
+    class GW,DK,NFT,DNS,MH,MC,SW,PC,PH,SRV box;
+    class Internet net;
 ```
 
 ---
