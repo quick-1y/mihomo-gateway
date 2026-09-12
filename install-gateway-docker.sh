@@ -387,6 +387,12 @@ write_nftables(){
 #!/usr/sbin/nft -f
 
 table inet gateway_filter {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "wan" tcp dport { 80, 7890, 9090 } drop
+    iifname "wan" udp dport 7890 drop
+  }
+
   chain forward {
     type filter hook forward priority filter; policy accept;
     iifname "lan" oifname "wan" accept
@@ -406,6 +412,12 @@ EOF2
 #!/usr/sbin/nft -f
 
 table inet gateway_filter {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "wan" tcp dport { 80, 7890, 9090 } drop
+    iifname "wan" udp dport 7890 drop
+  }
+
   chain forward {
     type filter hook forward priority filter; policy accept;
   }
@@ -423,7 +435,7 @@ configure_nftables(){
     nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables."; return 1; }
     success "Конфигурация nftables — OK"
     systemctl enable nftables >/dev/null 2>&1 || true
-    run_timed "Применение nftables" nft -f "$NFT_FILE"
+    run_timed "Применение nftables" systemctl restart nftables
 }
 
 configure_forwarding(){
@@ -796,7 +808,7 @@ apply_generated(){
     netplan generate
     write_nftables
     nft -c -f "$NFT_FILE"
-    run_timed "Применение nftables" nft -f "$NFT_FILE" || return 1
+	run_timed "Применение nftables" systemctl restart nftables || return 1
     run_timed "Применение Netplan" apply_netplan_checked || return 1
     configure_dnsmasq
     render_mihomo_config
