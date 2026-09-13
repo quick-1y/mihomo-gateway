@@ -63,8 +63,8 @@ sudo ./install-gateway-docker.sh
 ```text
 mihomo-gateway/
 ├── install-gateway-docker.sh
-├── README.md
-└── LICENSE
+└── mihomo/
+    └── config.yaml
 ```
 
 ---
@@ -81,9 +81,7 @@ mihomo-gateway/
 
 ## 📦 Файлы конфигурации
 
-- `gateway.conf` — основные параметры шлюза
-- `mihomo.yaml.template` — шаблон конфига Mihomo
-- `compose.yaml.template` — шаблон Docker Compose
+- `mihomo/config.yaml` — шаблон конфига Mihomo
 
 ---
 
