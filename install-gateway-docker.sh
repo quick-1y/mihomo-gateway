@@ -18,6 +18,12 @@ readonly COMPOSE_FILE="${PROJECT_DIR}/compose.yaml"
 readonly MIHOMO_CONFIG_DIR="${PROJECT_DIR}/config"
 readonly MIHOMO_CONFIG="${MIHOMO_CONFIG_DIR}/config.yaml"
 readonly ENV_FILE="${PROJECT_DIR}/.env"
+
+# Mihomo configuration template stored separately in the repository.
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly MIHOMO_TEMPLATE_LOCAL="${SCRIPT_DIR}/mihomo/config.yaml"
+readonly MIHOMO_TEMPLATE_URL="https://raw.githubusercontent.com/quick-1y/mihomo-gateway/main/mihomo/config.yaml"
+readonly MIHOMO_TEMPLATE_CACHE="/tmp/mihomo-gateway-config.yaml"
 readonly LAN_DEFAULT="192.168.100.1"
 readonly DHCP_START_DEFAULT="192.168.100.100"
 readonly DHCP_END_DEFAULT="192.168.100.250"
@@ -541,142 +547,70 @@ prompt_subscription_install(){
 render_mihomo_config(){
     [[ -n "$CLASH_SECRET" ]] || { error "Не задан CLASH_SECRET."; return 1; }
     [[ -n "$SUBSCRIPTION_URL" ]] || { error "Не задана подписка."; return 1; }
+
+    local template
+    template="$MIHOMO_TEMPLATE_LOCAL"
+
+    # Support both:
+    #   1. running from a cloned repository;
+    #   2. downloading only install-gateway-docker.sh via curl.
+    if [[ ! -f "$template" ]]; then
+        info "Шаблон Mihomo не найден локально. Загружаю его из GitHub..."
+        run_timed "Загрузка шаблона Mihomo" curl -fsSL --max-time 20 -o "$MIHOMO_TEMPLATE_CACHE" "$MIHOMO_TEMPLATE_URL" || {
+            error "Не удалось загрузить mihomo/config.yaml."
+            error "Для запуска из клонированного репозитория файл должен находиться: $MIHOMO_TEMPLATE_LOCAL"
+            return 1
+        }
+        template="$MIHOMO_TEMPLATE_CACHE"
+    fi
+
+    # Validate the template before touching the active configuration.
+    local required marker
+    for marker in \
+        "__LAN_IP__" \
+        "__LAN_NETWORK__" \
+        "__CLASH_SECRET__" \
+        "__SUBSCRIPTION_URL__"; do
+        grep -Fq "$marker" "$template" || {
+            error "В шаблоне Mihomo отсутствует обязательный placeholder: ${marker}"
+            return 1
+        }
+    done
+
     mkdir -p "$MIHOMO_CONFIG_DIR/ruleset" "$MIHOMO_CONFIG_DIR/proxy_providers"
-    local safe
-    safe="${SUBSCRIPTION_URL//\\/\\\\}"; safe="${safe//\"/\\\"}"
-    cat > "$MIHOMO_CONFIG" <<EOF2
-mixed-port: 7890
-allow-lan: true
-bind-address: "*"
 
-mode: rule
-log-level: info
-ipv6: false
+    local lan_network
+    lan_network="${LAN_IP%.*}.0/24"
 
-external-controller: "0.0.0.0:9090"
-secret: "${CLASH_SECRET}"
+    # Python is intentionally not required: use awk for literal placeholder
+    # replacement. Values are encoded as shell variables and escaped for awk.
+    # This safely handles &, backslashes, quotes, slashes and URL characters.
+    local escaped_lan_ip escaped_lan_network escaped_secret escaped_url
+    escaped_lan_ip=$(printf '%s' "$LAN_IP" | sed 's/[\\&|]/\\&/g')
+    escaped_lan_network=$(printf '%s' "$lan_network" | sed 's/[\\&|]/\\&/g')
+    escaped_secret=$(printf '%s' "$CLASH_SECRET" | sed 's/[\\&|]/\\&/g')
+    escaped_url=$(printf '%s' "$SUBSCRIPTION_URL" | sed 's/[\\&|]/\\&/g')
 
-external-controller-cors:
-  allow-origins:
-    - "http://${LAN_IP}"
-  allow-private-network: true
+    sed \
+        -e "s|__LAN_IP__|${escaped_lan_ip}|g" \
+        -e "s|__LAN_NETWORK__|${escaped_lan_network}|g" \
+        -e "s|__CLASH_SECRET__|${escaped_secret}|g" \
+        -e "s|__SUBSCRIPTION_URL__|${escaped_url}|g" \
+        "$template" > "$MIHOMO_CONFIG"
 
-proxy-providers:
-  subscription:
-    type: http
-    url: "${safe}"
-    path: ./proxy_providers/subscription.yaml
-    interval: 3600
-    health-check:
-      enable: true
-      url: https://www.gstatic.com/generate_204
-      interval: 300
-      timeout: 5000
-      expected-status: 204
-
-proxy-groups:
-  - name: AUTO
-    type: url-test
-    include-all: true
-    exclude-type: direct
-    exclude-filter: "(?i)автовыбор|авто|auto|automatic|auto.?select"
-    url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 150
-    empty-fallback: COMPATIBLE
-
-  - name: PROXY
-    type: select
-    proxies:
-      - AUTO
-      - DIRECT
-    default-selected: AUTO
-
-tun:
-  enable: true
-  stack: system
-  auto-route: true
-  auto-redirect: false
-  auto-detect-interface: true
-  route-exclude-address:
-    - ${LAN_IP%.*}.0/24
-    - 192.168.1.0/24
-    - 1.1.1.1/32
-    - 8.8.8.8/32
-
-sniffer:
-  enable: true
-  sniff:
-    HTTP:
-      ports: [80, 8080-8880]
-      override-destination: true
-    TLS:
-      ports: [443, 8443]
-    QUIC:
-      ports: [443, 8443]
-
-rule-providers:
-  youtube:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/youtube.mrs"
-    path: ./ruleset/youtube.mrs
-    interval: 86400
-  discord:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord.mrs"
-    path: ./ruleset/discord.mrs
-    interval: 86400
-  discord-ip:
-    type: http
-    behavior: ipcidr
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord-ip.mrs"
-    path: ./ruleset/discord-ip.mrs
-    interval: 86400
-  telegram:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram.mrs"
-    path: ./ruleset/telegram.mrs
-    interval: 86400
-  telegram-ip:
-    type: http
-    behavior: ipcidr
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram-ip.mrs"
-    path: ./ruleset/telegram-ip.mrs
-    interval: 86400
-  ai:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/ai.mrs"
-    path: ./ruleset/ai.mrs
-    interval: 86400
-  category-geoblock-ru:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/category-geoblock-ru.mrs"
-    path: ./ruleset/category-geoblock-ru.mrs
-    interval: 86400
-
-rules:
-  - RULE-SET,youtube,PROXY
-  - RULE-SET,discord,PROXY
-  - RULE-SET,discord-ip,PROXY,no-resolve
-  - RULE-SET,telegram,PROXY
-  - RULE-SET,telegram-ip,PROXY,no-resolve
-  - RULE-SET,ai,PROXY
-  - RULE-SET,category-geoblock-ru,PROXY
-  - MATCH,DIRECT
-EOF2
     chmod 600 "$MIHOMO_CONFIG"
+
+    # Never leave a downloaded copy containing configuration placeholders/values
+    # behind after rendering.
+    [[ "$template" == "$MIHOMO_TEMPLATE_CACHE" ]] && rm -f "$MIHOMO_TEMPLATE_CACHE"
+
+    # Final sanity check: no template markers may remain in the generated file.
+    if grep -Eq '__[A-Z0-9_]+__' "$MIHOMO_CONFIG"; then
+        error "В сгенерированном config.yaml остались не заменённые placeholders."
+        return 1
+    fi
+
+    success "Конфигурация Mihomo сгенерирована из отдельного шаблона."
 }
 
 create_compose(){
@@ -1118,7 +1052,7 @@ full_remove(){
 self_test(){
     local missing=()
     local cmd
-    for cmd in bash grep sed awk ip systemctl; do
+    for cmd in bash grep sed awk ip systemctl curl; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if (( ${#missing[@]} > 0 )); then
