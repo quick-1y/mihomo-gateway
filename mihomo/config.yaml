@@ -1,0 +1,130 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+
+mode: rule
+log-level: info
+ipv6: false
+
+external-controller: "0.0.0.0:9090"
+secret: "__CLASH_SECRET__"
+
+external-controller-cors:
+  allow-origins:
+    - "http://__LAN_IP__"
+  allow-private-network: true
+
+proxy-providers:
+  subscription:
+    type: http
+    url: "__SUBSCRIPTION_URL__"
+    path: ./proxy_providers/subscription.yaml
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      expected-status: 204
+
+proxy-groups:
+  - name: AUTO
+    type: url-test
+    include-all: true
+    exclude-type: direct
+    exclude-filter: "(?i)автовыбор|авто|auto|automatic|auto.?select"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 150
+    empty-fallback: COMPATIBLE
+
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO
+      - DIRECT
+    default-selected: AUTO
+
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-redirect: false
+  auto-detect-interface: true
+  route-exclude-address:
+    - __LAN_NETWORK__
+    - 192.168.1.0/24
+    - 1.1.1.1/32
+    - 8.8.8.8/32
+
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+
+rule-providers:
+  youtube:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/youtube.mrs"
+    path: ./ruleset/youtube.mrs
+    interval: 86400
+  discord:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord.mrs"
+    path: ./ruleset/discord.mrs
+    interval: 86400
+  discord-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord-ip.mrs"
+    path: ./ruleset/discord-ip.mrs
+    interval: 86400
+  telegram:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram.mrs"
+    path: ./ruleset/telegram.mrs
+    interval: 86400
+  telegram-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram-ip.mrs"
+    path: ./ruleset/telegram-ip.mrs
+    interval: 86400
+  ai:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/ai.mrs"
+    path: ./ruleset/ai.mrs
+    interval: 86400
+  category-geoblock-ru:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/category-geoblock-ru.mrs"
+    path: ./ruleset/category-geoblock-ru.mrs
+    interval: 86400
+
+rules:
+  - RULE-SET,youtube,PROXY
+  - RULE-SET,discord,PROXY
+  - RULE-SET,discord-ip,PROXY,no-resolve
+  - RULE-SET,telegram,PROXY
+  - RULE-SET,telegram-ip,PROXY,no-resolve
+  - RULE-SET,ai,PROXY
+  - RULE-SET,category-geoblock-ru,PROXY
+  - MATCH,DIRECT
