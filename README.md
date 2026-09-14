@@ -87,4 +87,4 @@ mihomo-gateway/
 
 ## 📄 Лицензия
 
-См. [LICENSE](LICENSE)
+[LICENSE](LICENSE)
