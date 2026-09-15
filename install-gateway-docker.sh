@@ -20,6 +20,25 @@ readonly NETPLAN_FILE="/etc/netplan/01-gateway.yaml"
 readonly DNSMASQ_FILE="/etc/dnsmasq.conf"
 readonly DNSMASQ_OVERRIDE="/etc/systemd/system/dnsmasq.service.d/override.conf"
 readonly NFT_FILE="/etc/nftables.conf"
+
+# PPPoE
+readonly PPPOE_PEER_NAME="mihomo-gateway"
+readonly PPPOE_PEER_FILE="/etc/ppp/peers/mihomo-gateway"
+readonly PAP_SECRETS="/etc/ppp/pap-secrets"
+readonly CHAP_SECRETS="/etc/ppp/chap-secrets"
+readonly SECRETS_BEGIN="# BEGIN mihomo-gateway"
+readonly SECRETS_END="# END mihomo-gateway"
+readonly PPPOE_IFACE="ppp0"
+readonly PPPOE_SERVICE="mihomo-gateway-pppoe.service"
+readonly PPPOE_WATCHDOG="mihomo-gateway-pppoe-watchdog"
+readonly PPPOE_UNIT_DIR="/etc/systemd/system"
+readonly PPPOE_HELPER_DIR="/usr/local/lib/mihomo-gateway"
+readonly PPPOE_STATE_DIR="${STATE_DIR}/pppoe"
+readonly PPPOE_PKG_FILE="${PPPOE_STATE_DIR}/installed-packages"
+readonly PPPOE_FAIL_FILE="${PPPOE_STATE_DIR}/fail-count"
+readonly NETPLAN_SAVE_DIR="${STATE_DIR}/netplan"
+readonly NETPLAN_DHCP_SAVE="${NETPLAN_SAVE_DIR}/wan-dhcp.yaml"
+readonly NETPLAN_PPPOE_SAVE="${NETPLAN_SAVE_DIR}/wan-pppoe.yaml"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-router.conf"
 
 readonly PROJECT_DIR="/opt/mihomo-gateway"
@@ -66,12 +85,15 @@ readonly RED GREEN YELLOW BLUE CYAN BOLD DIM NC
 readonly LINE="══════════════════════════════════════════════════════════════"
 
 # Keys allowed in the state file.
-readonly CONFIG_KEYS="LAN_IP DHCP_START DHCP_END DNS1 DNS2 LAN_IFACE WAN_IFACE LAN_MAC WAN_MAC NAT_ENABLED SUBSCRIPTION_URL CLASH_SECRET"
+# PPPOE_PASSWORD is intentionally absent: it lives only in /etc/ppp/*-secrets (0600).
+readonly CONFIG_KEYS="LAN_IP DHCP_START DHCP_END DNS1 DNS2 LAN_IFACE WAN_IFACE LAN_MAC WAN_MAC NAT_ENABLED SUBSCRIPTION_URL CLASH_SECRET WAN_MODE PPPOE_USER PPPOE_INITIALIZED PPPOE_AUTO_ROLLBACK PPPOE_ATTEMPTS PPPOE_FAIL_THRESHOLD"
 
 LAN_IFACE=""; WAN_IFACE=""; LAN_MAC=""; WAN_MAC=""
 LAN_IP="$LAN_DEFAULT"; DHCP_START="$DHCP_START_DEFAULT"; DHCP_END="$DHCP_END_DEFAULT"
 DNS1="$DNS1_DEFAULT"; DNS2="$DNS2_DEFAULT"; CLASH_SECRET=""; SUBSCRIPTION_URL=""
 NAT_ENABLED="1"
+WAN_MODE="dhcp"; PPPOE_USER=""; PPPOE_INITIALIZED="0"
+PPPOE_AUTO_ROLLBACK="0"; PPPOE_ATTEMPTS="10"; PPPOE_FAIL_THRESHOLD="5"
 
 TEMPLATE_CACHE=""
 
@@ -214,6 +236,13 @@ load_config(){
     SUBSCRIPTION_URL="${SUBSCRIPTION_URL:-}"; CLASH_SECRET="${CLASH_SECRET:-}"
     LAN_IFACE="${LAN_IFACE:-}"; WAN_IFACE="${WAN_IFACE:-}"
     LAN_MAC="${LAN_MAC:-}"; WAN_MAC="${WAN_MAC:-}"
+    WAN_MODE="${WAN_MODE:-dhcp}"
+    [[ "$WAN_MODE" == pppoe || "$WAN_MODE" == dhcp ]] || WAN_MODE="dhcp"
+    PPPOE_USER="${PPPOE_USER:-}"
+    PPPOE_INITIALIZED="${PPPOE_INITIALIZED:-0}"
+    PPPOE_AUTO_ROLLBACK="${PPPOE_AUTO_ROLLBACK:-0}"
+    [[ "${PPPOE_ATTEMPTS:-}" =~ ^[0-9]+$ ]] || PPPOE_ATTEMPTS="10"
+    [[ "${PPPOE_FAIL_THRESHOLD:-}" =~ ^[0-9]+$ ]] || PPPOE_FAIL_THRESHOLD="5"
     return 0
 }
 
@@ -351,8 +380,15 @@ backup_once(){
 # ignore-carrier keeps the LAN address configured even with the cable unplugged,
 # so 192.168.100.1 exists for dnsmasq and for the zashboard port binding.
 netplan_body(){
-    local extra=""
+    local extra="" wan_cfg
     [[ "$1" == 1 ]] && extra=$'\n      ignore-carrier: true'
+    # In PPPoE mode netplan owns the link only; pppd owns the session and the
+    # default route. LAN stanza is byte-identical in both modes.
+    if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+        wan_cfg=$'      dhcp4: false\n      dhcp6: false\n      accept-ra: false'
+    else
+        wan_cfg='      dhcp4: true'
+    fi
     cat > "$NETPLAN_FILE" <<EOF2
 network:
   version: 2
@@ -370,7 +406,7 @@ network:
         macaddress: ${WAN_MAC}
       set-name: wan
       optional: true
-      dhcp4: true
+${wan_cfg}
 EOF2
     chmod 600 "$NETPLAN_FILE"
 }
@@ -385,6 +421,7 @@ write_netplan(){
         netplan_body 0
         netplan generate >/dev/null 2>&1 || { error "Ошибка конфигурации Netplan."; return 1; }
     fi
+    save_wan_rollback "${WAN_MODE:-dhcp}"
     return 0
 }
 
@@ -528,6 +565,7 @@ EOF2
 
 # ─────────────────────────────── nftables ────────────────────────────
 write_nftables(){
+    local out; out="$(wan_out_iface)"     # wan in DHCP mode, ppp0 in PPPoE mode
     local nat_block=""
     if [[ "$NAT_ENABLED" == "1" ]]; then
         nat_block=$(cat <<EOF2
@@ -535,7 +573,7 @@ write_nftables(){
 table ip gateway_nat {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "wan" ip saddr $(subnet_of "$LAN_IP").0/24 masquerade
+    oifname "${out}" ip saddr $(subnet_of "$LAN_IP").0/24 masquerade
   }
 }
 EOF2
@@ -548,16 +586,17 @@ EOF2
 table inet gateway_filter {
   chain input {
     type filter hook input priority filter; policy accept;
-    iifname "wan" tcp dport { 80, 7890, 9090 } drop
-    iifname "wan" udp dport { 53, 7890 } drop
-    iifname "wan" tcp dport 53 drop
+    iifname { "wan", "${PPPOE_IFACE}" } tcp dport { 80, 7890, 9090 } drop
+    iifname { "wan", "${PPPOE_IFACE}" } udp dport { 53, 7890 } drop
+    iifname { "wan", "${PPPOE_IFACE}" } tcp dport 53 drop
   }
 
   chain forward {
     type filter hook forward priority filter; policy accept;
-$( [[ "$NAT_ENABLED" == "1" ]] && cat <<'EOF3'
-    iifname "lan" oifname "wan" accept
-    iifname "wan" oifname "lan" ct state established,related accept
+$( [[ "$NAT_ENABLED" == "1" ]] && cat <<EOF3
+    iifname "lan" oifname "${out}" accept
+    iifname "${out}" oifname "lan" ct state established,related accept
+    oifname "${out}" tcp flags syn tcp option maxseg size set rt mtu
 EOF3
 )
   }
@@ -850,6 +889,712 @@ validate_config(){
         "$MIHOMO_IMAGE" -d /root/.config/mihomo -t
 }
 
+# ═══════════════════════════════ PPPoE ═══════════════════════════════
+# WAN has two modes and only ever one netplan file:
+#   dhcp  — wan: dhcp4: true                      (existing behaviour)
+#   pppoe — wan: link only, no address; the session is owned by pppd via
+#           mihomo-gateway-pppoe.service, ppp0 carries the default route.
+# Mode switches rewrite ONLY the wan stanza and are applied with
+# `networkctl reconfigure wan`, never `netplan apply`, so lan/SSH is untouched.
+
+wan_out_iface(){ [[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo "$PPPOE_IFACE" || echo "wan"; }
+mask_secret(){
+    local s="${1:-}"
+    [[ -z "$s" ]] && { echo "—"; return 0; }
+    (( ${#s} <= 2 )) && { echo "***"; return 0; }
+    printf '%s***%s\n' "${s:0:2}" "${s: -1}"
+}
+
+iface_ipv4(){ ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
+default_gw_via(){ ip -4 route show default 2>/dev/null | awk -v d="$1" '$0 ~ ("dev "d)  {print $3; exit}'; }
+default_dev(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+
+internet_ok(){
+    ping -c1 -W2 -n 1.1.1.1 >/dev/null 2>&1 && return 0
+    ping -c1 -W2 -n 8.8.8.8 >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 4 -o /dev/null http://connectivitycheck.gstatic.com/generate_204 2>/dev/null
+}
+
+pppoe_service_active(){ systemctl is-active --quiet "$PPPOE_SERVICE" 2>/dev/null; }
+
+# Real network state, deliberately independent of the systemd unit state.
+pppoe_link_ok(){
+    ip link show "$PPPOE_IFACE" >/dev/null 2>&1 || return 1
+    [[ -n "$(iface_ipv4 "$PPPOE_IFACE")" ]]     || return 1
+    ip -4 route show default 2>/dev/null | grep -q "dev ${PPPOE_IFACE}" || return 1
+    return 0
+}
+pppoe_session_ok(){ pppoe_link_ok && internet_ok; }
+
+wan_link_ok(){
+    [[ -n "$(iface_ipv4 wan)" ]] || return 1
+    ip -4 route show default 2>/dev/null | grep -q "dev wan" || return 1
+    return 0
+}
+
+# ── пакеты ───────────────────────────────────────────────────────────
+pppoe_install_packages(){
+    header "PPPoE · УСТАНОВКА ПАКЕТОВ"
+    info "Пакеты ставятся, пока WAN ещё работает по DHCP."
+    mkdir -p "$PPPOE_STATE_DIR"; chmod 700 "$PPPOE_STATE_DIR"
+
+    local p newly=()
+    for p in ppp pppoe; do
+        pkg_installed "$p" || newly+=("$p")
+    done
+
+    if ! pkg_installed ppp; then
+        apt_install ppp || { error "Не удалось установить пакет ppp."; return 1; }
+    fi
+    # pppoe(8) is optional: the rp-pppoe.so plugin ships with ppp itself.
+    if ! pkg_installed pppoe; then
+        apt_install pppoe || warn "Пакет pppoe не установлен — используется плагин rp-pppoe.so из ppp."
+    fi
+
+    # Remember only what WE installed, so full removal never purges
+    # packages that were present before the gateway.
+    for p in "${newly[@]}"; do
+        pkg_installed "$p" && ! grep -qx "$p" "$PPPOE_PKG_FILE" 2>/dev/null && echo "$p" >> "$PPPOE_PKG_FILE"
+    done
+    [[ -f "$PPPOE_PKG_FILE" ]] && chmod 600 "$PPPOE_PKG_FILE"
+
+    command -v pppd >/dev/null 2>&1 || { error "pppd не найден после установки."; return 1; }
+    local plugin
+    plugin=$(find /usr/lib/pppd -name 'rp-pppoe.so' 2>/dev/null | head -n1)
+    [[ -n "$plugin" ]] || { error "Плагин rp-pppoe.so не найден. PPPoE недоступен."; return 1; }
+    success "pppd и плагин rp-pppoe.so готовы."
+}
+
+# ── учётные данные ───────────────────────────────────────────────────
+# The password is never stored in gateway.env, never passed as an argv
+# argument and never printed: it goes straight into the 0600 secrets files.
+pppoe_prompt_credentials(){
+    header "PPPoE · УЧЁТНЫЕ ДАННЫЕ ПРОВАЙДЕРА"
+    local u p1 p2
+    while true; do
+        read -rp "Логин PPPoE${PPPOE_USER:+ [$(mask_secret "$PPPOE_USER")]}: " u || return 1
+        [[ -z "$u" && -n "$PPPOE_USER" ]] && u="$PPPOE_USER"
+        [[ -n "$u" ]] || { warn "Логин не может быть пустым."; continue; }
+        [[ "$u" != *'"'* && "$u" != *'\'* ]] || { warn "Символы \" и \\ недопустимы."; continue; }
+        break
+    done
+    while true; do
+        read -rsp "Пароль PPPoE: " p1; echo
+        [[ -n "$p1" ]] || { warn "Пароль не может быть пустым."; continue; }
+        [[ "$p1" != *'"'* && "$p1" != *'\'* ]] || { warn "Символы \" и \\ недопустимы."; continue; }
+        read -rsp "Повторите пароль: " p2; echo
+        [[ "$p1" == "$p2" ]] || { warn "Пароли не совпадают."; continue; }
+        break
+    done
+    PPPOE_USER="$u"
+    pppoe_write_secrets "$u" "$p1" || return 1
+    unset p1 p2
+    write_config
+    success "Учётные данные сохранены (файлы 0600, доступны только root)."
+}
+
+pppoe_write_secrets(){
+    local user="$1" pass="$2" f tmp base
+    for f in "$PAP_SECRETS" "$CHAP_SECRETS"; do
+        [[ -f "$f" ]] || { install -m 600 /dev/null "$f"; }
+        base=$(basename "$f")
+        [[ -f "${ORIGINAL_DIR}/${base}" ]] || cp -a "$f" "${ORIGINAL_DIR}/${base}" 2>/dev/null || true
+        tmp=$(mktemp); chmod 600 "$tmp"
+        sed "/^${SECRETS_BEGIN}\$/,/^${SECRETS_END}\$/d" "$f" > "$tmp" 2>/dev/null || true
+        {
+            echo "$SECRETS_BEGIN"
+            printf '"%s" * "%s" *\n' "$user" "$pass"
+            echo "$SECRETS_END"
+        } >> "$tmp"
+        cat "$tmp" > "$f"
+        rm -f "$tmp"
+        chmod 600 "$f"; chown root:root "$f" 2>/dev/null || true
+    done
+    return 0
+}
+
+pppoe_have_credentials(){
+    [[ -n "${PPPOE_USER:-}" ]] || return 1
+    grep -q "^${SECRETS_BEGIN}$" "$PAP_SECRETS" 2>/dev/null || return 1
+    return 0
+}
+
+pppoe_write_peer(){
+    mkdir -p /etc/ppp/peers
+    cat > "$PPPOE_PEER_FILE" <<EOF2
+# mihomo-gateway PPPoE peer — генерируется автоматически
+plugin rp-pppoe.so
+wan
+user "${PPPOE_USER}"
+ifname ${PPPOE_IFACE}
+linkname ${PPPOE_PEER_NAME}
+noipdefault
+defaultroute
+replacedefaultroute
+noauth
+hide-password
+persist
+maxfail 0
+holdoff 5
+lcp-echo-interval 20
+lcp-echo-failure 3
+mtu 1492
+mru 1492
+noaccomp
+nodeflate
+nobsdcomp
+EOF2
+    chmod 600 "$PPPOE_PEER_FILE"
+}
+
+pppoe_write_units(){
+    cat > "${PPPOE_UNIT_DIR}/${PPPOE_SERVICE}" <<EOF2
+[Unit]
+Description=Mihomo Gateway PPPoE link (WAN)
+Documentation=man:pppd(8)
+After=network.target sys-subsystem-net-devices-wan.device
+BindsTo=sys-subsystem-net-devices-wan.device
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/pppd call ${PPPOE_PEER_NAME} nodetach
+ExecStopPost=-/usr/bin/env true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+    chmod 644 "${PPPOE_UNIT_DIR}/${PPPOE_SERVICE}"
+    pppoe_write_watchdog
+    systemctl daemon-reload
+}
+
+# ── watchdog (только при включённом авто-откате) ─────────────────────
+pppoe_write_watchdog(){
+    mkdir -p "$PPPOE_HELPER_DIR"
+    cat > "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh" <<EOF2
+#!/usr/bin/env bash
+# mihomo-gateway PPPoE watchdog — генерируется автоматически.
+# Откатывает WAN на DHCP только если пользователь включил авто-откат
+# И сессия PPPoE не поднимается подряд N проверок.
+set -uo pipefail
+CONFIG_FILE="${CONFIG_FILE}"
+FAIL_FILE="${PPPOE_FAIL_FILE}"
+NETPLAN_FILE="${NETPLAN_FILE}"
+NETPLAN_DHCP_SAVE="${NETPLAN_DHCP_SAVE}"
+PPPOE_IFACE="${PPPOE_IFACE}"
+PPPOE_SERVICE="${PPPOE_SERVICE}"
+WATCHDOG_TIMER="${PPPOE_WATCHDOG}.timer"
+EOF2
+    cat >> "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh" <<'EOF2'
+
+cfg(){ sed -n "s/^$1='\(.*\)'\$/\1/p" "$CONFIG_FILE" 2>/dev/null | tail -n1; }
+
+[[ -f "$CONFIG_FILE" ]] || exit 0
+[[ "$(cfg WAN_MODE)" == pppoe ]] || exit 0
+[[ "$(cfg PPPOE_AUTO_ROLLBACK)" == 1 ]] || exit 0
+
+threshold=$(cfg PPPOE_FAIL_THRESHOLD); [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=5
+(( threshold >= 1 )) || threshold=5
+
+session_ok(){
+    ip link show "$PPPOE_IFACE" >/dev/null 2>&1 || return 1
+    ip -4 -o addr show "$PPPOE_IFACE" 2>/dev/null | grep -q inet || return 1
+    ip -4 route show default 2>/dev/null | grep -q "dev ${PPPOE_IFACE}" || return 1
+    ping -c1 -W2 -n 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 -n 8.8.8.8 >/dev/null 2>&1
+}
+
+if session_ok; then
+    echo 0 > "$FAIL_FILE"
+    exit 0
+fi
+
+n=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+[[ "$n" =~ ^[0-9]+$ ]] || n=0
+n=$((n + 1))
+echo "$n" > "$FAIL_FILE"
+logger -t mihomo-gateway-pppoe "PPPoE session down (${n}/${threshold})"
+(( n >= threshold )) || exit 0
+
+logger -t mihomo-gateway-pppoe "PPPoE failed ${n} times — rolling back WAN to DHCP"
+systemctl stop "$PPPOE_SERVICE" 2>/dev/null || true
+systemctl disable "$PPPOE_SERVICE" 2>/dev/null || true
+
+if [[ -f "$NETPLAN_DHCP_SAVE" ]]; then
+    cp -a "$NETPLAN_DHCP_SAVE" "$NETPLAN_FILE"
+    netplan generate 2>/dev/null || true
+    # Only the WAN link is reconfigured: LAN and SSH stay up.
+    networkctl reload >/dev/null 2>&1 || true
+    networkctl reconfigure wan >/dev/null 2>&1 || true
+fi
+sed -i "s/^WAN_MODE=.*/WAN_MODE='dhcp'/" "$CONFIG_FILE" 2>/dev/null || true
+echo 0 > "$FAIL_FILE"
+systemctl disable --now "$WATCHDOG_TIMER" 2>/dev/null || true
+logger -t mihomo-gateway-pppoe "Rollback to DHCP finished"
+EOF2
+    chmod 700 "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh"
+
+    cat > "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.service" <<EOF2
+[Unit]
+Description=Mihomo Gateway PPPoE watchdog
+
+[Service]
+Type=oneshot
+ExecStart=${PPPOE_HELPER_DIR}/pppoe-watchdog.sh
+EOF2
+    cat > "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.timer" <<EOF2
+[Unit]
+Description=Mihomo Gateway PPPoE watchdog timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF2
+    chmod 644 "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.service" "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.timer"
+}
+
+pppoe_sync_watchdog(){
+    systemctl daemon-reload
+    mkdir -p "$PPPOE_STATE_DIR"; echo 0 > "$PPPOE_FAIL_FILE"
+    if [[ "${PPPOE_AUTO_ROLLBACK:-0}" == 1 && "${WAN_MODE:-dhcp}" == pppoe ]]; then
+        systemctl enable --now "${PPPOE_WATCHDOG}.timer" >/dev/null 2>&1 \
+            && success "Авто-откат включён (порог: ${PPPOE_FAIL_THRESHOLD} проверок)." \
+            || warn "Не удалось включить таймер авто-отката."
+    else
+        systemctl disable --now "${PPPOE_WATCHDOG}.timer" >/dev/null 2>&1 || true
+    fi
+}
+
+# ── переключение режима WAN (LAN не трогаем) ─────────────────────────
+save_wan_rollback(){
+    mkdir -p "$NETPLAN_SAVE_DIR"; chmod 700 "$NETPLAN_SAVE_DIR"
+    case "${1:-}" in
+        dhcp)  cp -a "$NETPLAN_FILE" "$NETPLAN_DHCP_SAVE" ;;
+        pppoe) cp -a "$NETPLAN_FILE" "$NETPLAN_PPPOE_SAVE" ;;
+    esac
+}
+
+# Reconfigures the wan link only. `netplan apply` would restart networkd
+# and can blip LAN/SSH, so it is the fallback of last resort.
+apply_wan_only(){
+    netplan generate || { error "netplan generate: ошибка конфигурации."; return 1; }
+    if command -v networkctl >/dev/null 2>&1; then
+        networkctl reload >/dev/null 2>&1 || true
+        networkctl reconfigure wan >/dev/null 2>&1 || warn "networkctl reconfigure wan вернул ошибку."
+    else
+        warn "networkctl недоступен — применяю netplan apply (LAN может моргнуть)."
+        netplan apply || return 1
+    fi
+    sleep 2
+    return 0
+}
+
+# Writes the netplan for the requested WAN mode and applies it to wan only.
+switch_wan_mode(){
+    local mode="$1" prev="${WAN_MODE:-dhcp}"
+    WAN_MODE="$mode"
+    if ! write_netplan; then
+        WAN_MODE="$prev"; write_netplan || true
+        error "Не удалось сгенерировать Netplan для режима ${mode}."
+        return 1
+    fi
+    save_wan_rollback "$mode"
+    if ! apply_wan_only; then
+        error "Не удалось применить сетевую конфигурацию WAN."
+        return 1
+    fi
+    if [[ "$mode" == pppoe ]]; then
+        # The DHCP lease must not linger on wan while pppd owns the link.
+        ip -4 addr flush dev wan 2>/dev/null || true
+    fi
+    return 0
+}
+
+wait_for_dhcp_wan(){
+    local i
+    for i in $(seq 1 20); do
+        wan_link_ok && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# ── подключение и откат ──────────────────────────────────────────────
+pppoe_try_connect(){
+    local attempts="${1:-10}" i j
+    systemctl enable "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+    for (( i = 1; i <= attempts; i++ )); do
+        info "Попытка подключения PPPoE ${i}/${attempts}..."
+        systemctl restart "$PPPOE_SERVICE" >/dev/null 2>&1 || warn "Служба PPPoE не стартовала."
+        for (( j = 0; j < 15; j++ )); do
+            sleep 2
+            pppoe_link_ok || continue
+            if internet_ok; then
+                success "PPPoE подключён: ${PPPOE_IFACE} $(iface_ipv4 "$PPPOE_IFACE")"
+                return 0
+            fi
+        done
+        if pppoe_link_ok; then
+            warn "Сессия поднялась, но интернета нет (попытка ${i})."
+        else
+            warn "Сессия PPPoE не установлена (попытка ${i})."
+        fi
+        systemctl stop "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+        sleep 2
+    done
+    error "PPPoE не подключился за ${attempts} попыток."
+    journalctl -u "$PPPOE_SERVICE" -n 20 --no-pager 2>/dev/null >&2 || true
+    return 1
+}
+
+pppoe_rollback_to_dhcp(){
+    header "PPPoE · АВТОМАТИЧЕСКИЙ ОТКАТ НА DHCP"
+    systemctl stop "$PPPOE_SERVICE"    >/dev/null 2>&1 || true
+    systemctl disable "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "${PPPOE_WATCHDOG}.timer" >/dev/null 2>&1 || true
+
+    if [[ -f "$NETPLAN_DHCP_SAVE" ]]; then
+        cp -a "$NETPLAN_DHCP_SAVE" "$NETPLAN_FILE"
+        info "Восстановлен сохранённый рабочий Netplan (DHCP)."
+    fi
+    WAN_MODE="dhcp"
+    write_netplan || warn "Не удалось перегенерировать Netplan, использую сохранённую копию."
+    if ! apply_wan_only; then
+        error "Откат: не удалось применить конфигурацию WAN."
+        error "LAN не затронут. Проверьте: networkctl status wan"
+        write_config
+        return 1
+    fi
+    write_config
+    write_nftables && reload_nftables || warn "Не удалось обновить правила NAT."
+
+    if wait_for_dhcp_wan; then
+        success "WAN снова работает по DHCP: $(iface_ipv4 wan)"
+        internet_ok && success "Интернет доступен." || warn "Адрес получен, но интернет не отвечает."
+        return 0
+    fi
+    error "Откат выполнен, но WAN не получил адрес по DHCP."
+    error "Проверьте кабель провайдера и: networkctl status wan"
+    return 1
+}
+
+# ── главный сценарий включения PPPoE ─────────────────────────────────
+pppoe_enable(){
+    header "PPPoE · ВКЛЮЧЕНИЕ"
+    [[ -n "${WAN_MAC:-}" ]] || { error "WAN-интерфейс не настроен."; return 1; }
+
+    if [[ "${WAN_MODE:-dhcp}" == pppoe ]] && pppoe_link_ok; then
+        success "PPPoE уже активен."
+        return 0
+    fi
+
+    echo "Порядок действий:"
+    echo "  1. Проверка текущего интернета через DHCP"
+    echo "  2. Установка пакетов PPPoE (нужен работающий интернет)"
+    echo "  3. Ввод учётных данных и подготовка конфигурации"
+    echo "  4. Сохранение рабочего DHCP-Netplan для отката"
+    echo "  5. Переключение WAN на PPPoE и до ${PPPOE_ATTEMPTS} попыток подключения"
+    echo "  6. При неудаче — автоматический откат на DHCP"
+    echo
+    echo "LAN и SSH остаются доступными на всех шагах."
+    echo
+    confirm "Продолжить?" || return 0
+
+    # 1. Internet over DHCP is needed for step 2.
+    header "PPPoE · ШАГ 1/6 · ПРОВЕРКА ИНТЕРНЕТА (DHCP)"
+    if internet_ok; then
+        success "Интернет через DHCP доступен: $(iface_ipv4 wan)"
+    else
+        warn "Интернет через текущее WAN-подключение недоступен."
+        warn "Пакеты PPPoE можно установить только при работающем интернете."
+        if ! pkg_installed ppp; then
+            error "Пакет ppp не установлен, а интернета нет. Включение PPPoE отменено."
+            return 1
+        fi
+        confirm "Пакет ppp уже установлен. Продолжить без проверки интернета?" || return 0
+    fi
+
+    # 2. Packages first — never switch the WAN before this succeeds.
+    header "PPPoE · ШАГ 2/6 · ПАКЕТЫ"
+    pppoe_install_packages || return 1
+
+    # 3. Credentials and configuration.
+    header "PPPoE · ШАГ 3/6 · КОНФИГУРАЦИЯ"
+    if pppoe_have_credentials; then
+        info "Найдены сохранённые учётные данные (логин: $(mask_secret "$PPPOE_USER"))."
+        confirm "Ввести новые?" && { pppoe_prompt_credentials || return 1; }
+    else
+        pppoe_prompt_credentials || return 1
+    fi
+    pppoe_write_peer
+    pppoe_write_units
+    success "Конфигурация pppd и служба созданы."
+
+    # 4. Known-good DHCP netplan kept as the rollback target.
+    header "PPPoE · ШАГ 4/6 · ТОЧКА ОТКАТА"
+    local prev_mode="${WAN_MODE:-dhcp}"
+    WAN_MODE="dhcp"; write_netplan || return 1
+    save_wan_rollback dhcp
+    WAN_MODE="$prev_mode"
+    success "Рабочая DHCP-конфигурация сохранена: ${NETPLAN_DHCP_SAVE}"
+
+    # 5. Switch WAN and connect.
+    header "PPPoE · ШАГ 5/6 · ПЕРЕКЛЮЧЕНИЕ WAN"
+    if ! switch_wan_mode pppoe; then
+        error "Переключение не удалось — возвращаю DHCP."
+        pppoe_rollback_to_dhcp || true
+        return 1
+    fi
+    success "WAN переведён в режим PPPoE (LAN не затронут)."
+    write_nftables && reload_nftables || warn "Не удалось обновить NAT для ppp0."
+
+    header "PPPoE · ШАГ 6/6 · ПОДКЛЮЧЕНИЕ"
+    if pppoe_try_connect "${PPPOE_ATTEMPTS:-10}"; then
+        PPPOE_INITIALIZED=1
+        WAN_MODE="pppoe"
+        write_config
+        save_wan_rollback pppoe
+        write_nftables && reload_nftables || warn "Не удалось обновить NAT."
+        pppoe_sync_watchdog
+        echo
+        success "PPPoE успешно инициализирован."
+        success "WAN IP: $(iface_ipv4 "$PPPOE_IFACE")  шлюз: $(default_gw_via "$PPPOE_IFACE")"
+        info "Временные сбои провайдера больше не приводят к откату на DHCP."
+        return 0
+    fi
+
+    # 6. All attempts failed → automatic, complete rollback.
+    error "Первое подключение PPPoE не удалось (${PPPOE_ATTEMPTS} попыток)."
+    error "Возможные причины: неверный логин/пароль, нет линка до провайдера, другой VLAN."
+    PPPOE_INITIALIZED=0
+    if pppoe_rollback_to_dhcp; then
+        warn "Система откачена на DHCP и работает. PPPoE выключен."
+    else
+        error "Откат завершился с ошибкой — проверьте WAN вручную."
+    fi
+    return 1
+}
+
+pppoe_disable(){
+    header "PPPoE · ВОЗВРАТ WAN НА DHCP"
+    [[ "${WAN_MODE:-dhcp}" == pppoe ]] || { info "WAN уже в режиме DHCP."; return 0; }
+    confirm "Вернуть WAN на DHCP? LAN и SSH не пострадают." || return 0
+
+    systemctl stop "$PPPOE_SERVICE"    >/dev/null 2>&1 || true
+    systemctl disable "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "${PPPOE_WATCHDOG}.timer" >/dev/null 2>&1 || true
+
+    if ! switch_wan_mode dhcp; then
+        error "Не удалось переключить WAN на DHCP."
+        return 1
+    fi
+    write_config
+    write_nftables && reload_nftables || warn "Не удалось обновить NAT."
+
+    if wait_for_dhcp_wan; then
+        success "WAN работает по DHCP: $(iface_ipv4 wan)"
+        internet_ok && success "Интернет доступен." || warn "Интернет пока не отвечает."
+    else
+        warn "WAN не получил адрес по DHCP. Проверьте кабель провайдера."
+    fi
+    info "Конфигурация и учётные данные PPPoE сохранены — можно включить снова."
+}
+
+# ── статус / диагностика ─────────────────────────────────────────────
+# ${v:+x}${v:-y} would print the value twice when v is set — use this instead.
+value_row(){
+    local label="$1" v="${2:-}"
+    if [[ -n "$v" ]]; then printf '  %s %b\n' "$(pad "$label" 14)" "${GREEN}● ${v}${NC}"
+    else                   printf '  %s %b\n' "$(pad "$label" 14)" "${RED}● —${NC}"; fi
+}
+
+pppoe_status_block(){
+    local ip gw
+    echo -e "${BOLD}WAN${NC}"
+    if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+        ip=$(iface_ipv4 "$PPPOE_IFACE"); gw=$(default_gw_via "$PPPOE_IFACE")
+        printf '  %s %b\n' "$(pad "Режим WAN" 14)"     "${CYAN}● PPPoE${NC}"
+        printf '  %s %b\n' "$(pad "Логин" 14)"         "${DIM}● $(mask_secret "${PPPOE_USER:-}")${NC}"
+        if pppoe_service_active; then
+            printf '  %s %b\n' "$(pad "Служба PPPoE" 14)" "${GREEN}● ACTIVE${NC}"
+        else
+            printf '  %s %b\n' "$(pad "Служба PPPoE" 14)" "${RED}● INACTIVE${NC}"
+        fi
+        if pppoe_link_ok; then
+            printf '  %s %b\n' "$(pad "Сессия PPPoE" 14)" "${GREEN}● CONNECTED${NC}"
+        else
+            printf '  %s %b\n' "$(pad "Сессия PPPoE" 14)" "${RED}● DOWN${NC}"
+        fi
+        value_row "WAN IP" "$ip"
+        value_row "Шлюз"   "$gw"
+        internet_ok && printf '  %s %b\n' "$(pad "Интернет" 14)" "${GREEN}● OK${NC}" \
+                    || printf '  %s %b\n' "$(pad "Интернет" 14)" "${RED}● FAIL${NC}"
+        if [[ "${PPPOE_AUTO_ROLLBACK:-0}" == 1 ]]; then
+            printf '  %s %b\n' "$(pad "Авто-откат" 14)" "${YELLOW}● ON (порог ${PPPOE_FAIL_THRESHOLD})${NC}"
+        else
+            printf '  %s %b\n' "$(pad "Авто-откат" 14)" "${DIM}● OFF${NC}"
+        fi
+        if [[ "${PPPOE_INITIALIZED:-0}" == 1 ]]; then
+            printf '  %s %b\n' "$(pad "Инициализация" 14)" "${GREEN}● YES${NC}"
+        else
+            printf '  %s %b\n' "$(pad "Инициализация" 14)" "${YELLOW}● NO${NC}"
+        fi
+    else
+        ip=$(iface_ipv4 wan); gw=$(default_gw_via wan)
+        printf '  %s %b\n' "$(pad "Режим WAN" 14)" "${CYAN}● DHCP${NC}"
+        value_row "WAN IP" "$ip"
+        value_row "Шлюз"   "$gw"
+        internet_ok && printf '  %s %b\n' "$(pad "Интернет" 14)" "${GREEN}● OK${NC}" \
+                    || printf '  %s %b\n' "$(pad "Интернет" 14)" "${RED}● FAIL${NC}"
+    fi
+}
+
+# ── меню ─────────────────────────────────────────────────────────────
+pppoe_menu(){
+    while true; do
+        header "НАСТРОЙКИ · WAN / PPPoE"
+        pppoe_status_block
+        echo
+        echo "  1) Включить PPPoE"
+        echo "  2) Выключить PPPoE (вернуть WAN на DHCP)"
+        echo "  3) Изменить логин и пароль"
+        echo "  4) Авто-откат на DHCP после инициализации"
+        echo "  5) Число попыток первого подключения (${PPPOE_ATTEMPTS})"
+        echo "  6) Проверить подключение сейчас"
+        echo "  7) Журнал PPPoE (последние 50 строк)"
+        echo "  0) Назад"
+        echo
+        local c v
+        read -rp "Выбор [0-7]: " c || return 0
+        case "$c" in
+            1) pppoe_enable || warn "PPPoE не включён." ;;
+            2) pppoe_disable || warn "Не удалось вернуть DHCP." ;;
+            3) if pppoe_prompt_credentials; then
+                   pppoe_write_peer
+                   if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+                       confirm "Переподключить PPPoE с новыми данными?" && {
+                           pppoe_try_connect "${PPPOE_ATTEMPTS:-10}" \
+                               || warn "Переподключение не удалось. Режим WAN не изменён."
+                       }
+                   fi
+               fi ;;
+            4) if [[ "${PPPOE_AUTO_ROLLBACK:-0}" == 1 ]]; then
+                   PPPOE_AUTO_ROLLBACK=0; write_config; pppoe_sync_watchdog
+                   success "Авто-откат выключен — при сбоях система остаётся на PPPoE."
+               else
+                   echo
+                   warn "Авто-откат вернёт WAN на DHCP, если сессия PPPoE не поднимется"
+                   warn "подряд N проверок (проверка раз в минуту)."
+                   read -rp "Порог неудачных проверок [${PPPOE_FAIL_THRESHOLD}]: " v || v=""
+                   if [[ -n "$v" ]]; then
+                       [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 60 )) \
+                           && PPPOE_FAIL_THRESHOLD="$v" || { warn "Нужно число 1–60."; press_enter; continue; }
+                   fi
+                   PPPOE_AUTO_ROLLBACK=1; write_config
+                   [[ -f "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh" ]] || pppoe_write_watchdog
+                   pppoe_sync_watchdog
+               fi ;;
+            5) read -rp "Число попыток первого подключения [${PPPOE_ATTEMPTS}]: " v || v=""
+               if [[ -n "$v" ]]; then
+                   if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 50 )); then
+                       PPPOE_ATTEMPTS="$v"; write_config; success "Сохранено: ${PPPOE_ATTEMPTS} попыток."
+                   else
+                       warn "Нужно число 1–50."
+                   fi
+               fi ;;
+            6) if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+                   pppoe_link_ok && success "Сессия PPPoE активна: $(iface_ipv4 "$PPPOE_IFACE")" \
+                                 || error "Сессия PPPoE не установлена."
+               else
+                   wan_link_ok && success "WAN (DHCP): $(iface_ipv4 wan)" || error "WAN без адреса."
+               fi
+               internet_ok && success "Интернет доступен." || error "Интернета нет." ;;
+            7) journalctl -u "$PPPOE_SERVICE" -n 50 --no-pager 2>/dev/null | less -R || warn "Журнал недоступен." ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+# ── первичная установка ──────────────────────────────────────────────
+maybe_setup_pppoe(){
+    header "ТИП ПОДКЛЮЧЕНИЯ WAN"
+    if [[ "${WAN_MODE:-dhcp}" == pppoe && "${PPPOE_INITIALIZED:-0}" == 1 ]]; then
+        info "WAN уже настроен на PPPoE."
+        pppoe_link_ok || { warn "Сессия не поднята — пробую запустить службу."; \
+            systemctl restart "$PPPOE_SERVICE" >/dev/null 2>&1 || true; sleep 5; }
+        pppoe_link_ok && success "PPPoE активен." || warn "PPPoE пока не подключён."
+        return 0
+    fi
+    echo "  1) DHCP  — провайдер выдаёт адрес автоматически (по умолчанию)"
+    echo "  2) PPPoE — провайдер требует логин и пароль"
+    echo
+    local c; read -rp "Выбор [1-2]: " c || c=1
+    case "$c" in
+        2) pppoe_enable || warn "PPPoE не активирован, установка продолжается на DHCP." ;;
+        *) WAN_MODE="dhcp"; write_config; success "WAN: DHCP." ;;
+    esac
+    return 0
+}
+
+# ── удаление ─────────────────────────────────────────────────────────
+# Safe and idempotent: running it twice changes nothing and returns 0.
+pppoe_purge(){
+    local f p purged=0
+
+    systemctl stop "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable "$PPPOE_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "${PPPOE_WATCHDOG}.timer" >/dev/null 2>&1 || true
+    systemctl stop "${PPPOE_WATCHDOG}.service" >/dev/null 2>&1 || true
+
+    # Tear the session down before the WAN config is restored.
+    if ip link show "$PPPOE_IFACE" >/dev/null 2>&1; then
+        pkill -f "pppd call ${PPPOE_PEER_NAME}" 2>/dev/null || true
+        sleep 1
+        ip link delete "$PPPOE_IFACE" 2>/dev/null || true
+    fi
+
+    for f in "${PPPOE_UNIT_DIR}/${PPPOE_SERVICE}" \
+             "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.service" \
+             "${PPPOE_UNIT_DIR}/${PPPOE_WATCHDOG}.timer" \
+             "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh" \
+             "$PPPOE_PEER_FILE"; do
+        [[ -e "$f" ]] && { rm -f "$f"; purged=1; }
+    done
+    rmdir "$PPPOE_HELPER_DIR" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Credentials: only our own delimited block is removed.
+    for f in "$PAP_SECRETS" "$CHAP_SECRETS"; do
+        [[ -f "$f" ]] || continue
+        if grep -q "^${SECRETS_BEGIN}$" "$f" 2>/dev/null; then
+            sed -i "/^${SECRETS_BEGIN}\$/,/^${SECRETS_END}\$/d" "$f"
+            chmod 600 "$f"; purged=1
+        fi
+    done
+
+    # Only packages this script installed are purged.
+    if [[ -f "$PPPOE_PKG_FILE" ]]; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] || continue
+            pkg_installed "$p" || continue
+            run_timed "Удаление пакета ${p}" \
+                env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$p" || true
+        done < "$PPPOE_PKG_FILE"
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+    fi
+
+    rm -rf "$PPPOE_STATE_DIR" "$NETPLAN_SAVE_DIR"
+    (( purged )) && success "Компоненты PPPoE удалены." || true
+    return 0
+}
+
 # ─────────────────────────────── проверки ────────────────────────────
 check_api(){
     [[ -n "$CLASH_SECRET" ]] || return 1
@@ -901,6 +1646,17 @@ quick_status(){
     fi
     systemctl is-active --quiet dnsmasq 2>/dev/null && status_row "DHCP" ok || status_row "DHCP" fail
 
+    if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+        if pppoe_link_ok; then
+            status_row "WAN" ok "PPPoE · $(iface_ipv4 "$PPPOE_IFACE")"
+        else
+            status_row "WAN" fail "PPPoE · сессия не установлена"
+        fi
+    else
+        local wip; wip=$(iface_ipv4 wan)
+        [[ -n "$wip" ]] && status_row "WAN" ok "DHCP · ${wip}" || status_row "WAN" off "DHCP · нет адреса"
+    fi
+
     if nft list table ip gateway_nat >/dev/null 2>&1; then
         status_row "NAT" ok "$(subnet_of "$LAN_IP").0/24 → wan"
     else
@@ -932,12 +1688,15 @@ full_diagnostics(){
     echo -e "${BOLD}СЕТЬ${NC}"
     echo "  LAN интерфейс: ${LAN_IFACE:-неизвестно}"
     echo "  LAN адрес:     ${LAN_IP}/24"
-    echo "  WAN интерфейс: ${WAN_IFACE:-неизвестно}"
+    echo "  WAN интерфейс: ${WAN_IFACE:-неизвестно} (режим: ${WAN_MODE:-dhcp})"
     echo "  DHCP:          ${DHCP_START}–${DHCP_END}"
     echo "  DNS upstream:  ${DNS1}, ${DNS2}"
     echo
     ip -br addr show lan 2>/dev/null || true
     ip -br addr show wan 2>/dev/null || true
+    [[ "${WAN_MODE:-dhcp}" == pppoe ]] && { ip -br addr show "$PPPOE_IFACE" 2>/dev/null || true; }
+    echo
+    pppoe_status_block
     echo
     echo -e "${BOLD}СЕРВИСЫ ХОСТА${NC}"
     local s
@@ -977,7 +1736,7 @@ full_diagnostics(){
     else
         echo -e "  Состояние:  ${YELLOW}выключен${NC}"
     fi
-    echo "  LAN → WAN:  $(subnet_of "$LAN_IP").0/24 → ${WAN_IFACE:-wan}"
+    echo "  LAN → WAN:  $(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
 }
 
 # ─────────────────────────────── установка ───────────────────────────
@@ -1009,6 +1768,7 @@ apply_generated(){
 install_stack(){
     header "УСТАНОВКА GATEWAY + MIHOMO"
     configure_forwarding || return 1
+    maybe_setup_pppoe    || true
     configure_nftables   || return 1
     configure_dnsmasq    || return 1
     install_docker       || return 1
@@ -1108,6 +1868,10 @@ rename_iface_back(){
 
 restore_netplan_files(){
     rm -f "$NETPLAN_FILE"
+    local sf
+    for sf in pap-secrets chap-secrets; do
+        [[ -f "${ORIGINAL_DIR}/${sf}" ]] && cp -a "${ORIGINAL_DIR}/${sf}" "/etc/ppp/${sf}" 2>/dev/null || true
+    done
     local f base
     shopt -s nullglob
     for f in /etc/netplan/*.yaml.gateway-disabled; do
@@ -1139,6 +1903,7 @@ full_remove(){
     echo "  • Mihomo / Zashboard"
     echo "  • Docker Engine и связанные пакеты"
     echo "  • nftables, IPv4 forwarding"
+    echo "  • PPPoE: служба, watchdog, peer, учётные данные, состояние"
     echo "  • dnsmasq / DHCP"
     echo "  • 01-gateway.yaml"
     echo "  • интерфейсы lan/wan будут переименованы обратно"
@@ -1153,6 +1918,10 @@ full_remove(){
     confirm "Начать полное удаление?" || return 0
 
     load_config || true
+
+    # PPPoE goes first: the session must be down before the WAN config is
+    # restored. LAN stays untouched by every step here.
+    pppoe_purge || true
 
     if command -v docker >/dev/null 2>&1; then
         [[ -f "$COMPOSE_FILE" ]] && compose down --remove-orphans --rmi local || true
@@ -1448,9 +2217,10 @@ settings_menu(){
         setting_row 5 "NAT"                  "$([[ "$NAT_ENABLED" == 1 ]] && echo включён || echo выключен)"
         setting_row 6 "Интерфейсы LAN / WAN" "${LAN_IFACE:-—} / ${WAN_IFACE:-—}"
         setting_row 7 "DNS upstream"         "${DNS1}, ${DNS2}"
+        setting_row 8 "WAN / PPPoE"          "$([[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo "PPPoE ($(mask_secret "$PPPOE_USER"))" || echo DHCP)"
         echo "  0) Назад"
         echo
-        local c; read -rp "Выбор [0-7]: " c || return 0
+        local c; read -rp "Выбор [0-8]: " c || return 0
         case "$c" in
             1) subscription_menu ;;
             2) password_menu ;;
@@ -1459,6 +2229,7 @@ settings_menu(){
             5) nat_menu ;;
             6) if ! interfaces_menu; then warn "Операция прервана."; fi; press_enter ;;
             7) if ! dns_menu; then warn "Операция прервана."; fi; press_enter ;;
+            8) pppoe_menu ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -1508,7 +2279,7 @@ main_menu(){
 
 self_test(){
     local missing=() cmd
-    for cmd in grep sed awk ip systemctl curl netplan mktemp; do
+    for cmd in grep sed awk ip systemctl curl netplan mktemp ping; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     (( ${#missing[@]} == 0 )) || die "Не найдены обязательные команды: ${missing[*]}"
