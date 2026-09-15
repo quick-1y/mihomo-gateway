@@ -700,8 +700,8 @@ quick_status(){
         || echo -e "  Mihomo        $(service_dot FAIL)"
 
     check_container zashboard \
-        && echo -e "  Zashboard     $(service_dot ok)" \
-        || echo -e "  Zashboard     $(service_dot FAIL)"
+        && echo -e "  zashboard     $(service_dot ok)" \
+        || echo -e "  zashboard     $(service_dot FAIL)"
 
     check_api \
         && echo -e "  API :9090     $(service_dot ok)" \
@@ -925,7 +925,7 @@ install_stack(){
     validate_config
 
     header "ЗАПУСК КОНТЕЙНЕРОВ"
-    run_timed "Запуск Mihomo + zashboard" bash -c "cd '$PROJECT_DIR' && docker compose up -d --remove-orphans"
+    run_timed "Запуск Mihomo + Zashboard" bash -c "cd '$PROJECT_DIR' && docker compose up -d --remove-orphans"
     sleep 5
     local _w
     for _w in 1 2 3 4 5 6; do
@@ -933,7 +933,7 @@ install_stack(){
         sleep 2
     done
     check_container mihomo && success "Mihomo → running" || { error "Mihomo не запущен."; docker logs --tail 60 mihomo || true; return 1; }
-    check_container zashboard && success "zashboard → running" || { error "zashboard не запущен."; docker logs --tail 60 zashboard || true; return 1; }
+    check_container zashboard && success "Zashboard → running" || { error "Zashboard не запущен."; docker logs --tail 60 zashboard || true; return 1; }
     sleep 2
     check_api && success "Mihomo API → доступен" || warn "Mihomo API пока не отвечает."
     check_ui && success "Панель → доступна" || warn "Панель пока не отвечает."
@@ -949,7 +949,7 @@ final_success(){
     echo -e "  Панель: ${CYAN}${BOLD}http://${LAN_IP}/${NC}"
     echo -e "  Mihomo API: ${CYAN}${BOLD}http://${LAN_IP}:9090${NC}"
     echo -e "  Proxy: ${CYAN}${BOLD}${LAN_IP}:7890${NC}"
-    echo; echo "  В MetaCubeXD используйте:"; echo "    Backend URL: http://${LAN_IP}:9090"; echo "    Secret: пароль, введённый при установке"; echo
+    echo; echo "  В Zashboard используйте:"; echo "    Backend URL: http://${LAN_IP}:9090"; echo "    Secret: пароль, введённый при установке"; echo
 }
 
 remove_stack(){
@@ -961,8 +961,6 @@ remove_stack(){
     if command -v docker >/dev/null 2>&1 && [[ -f "$COMPOSE_FILE" ]]; then
         ( cd "$PROJECT_DIR" && docker compose down --remove-orphans --rmi local ) || true
     else
-        docker rm -f mihomo metacubexd >/dev/null 2>&1 || true
-		#!TODO mihomo metacubexd убрать после перехода на zashboard
 		docker rm -f zashboard 2>/dev/null || true
     fi
     rm -rf "$PROJECT_DIR"
@@ -1010,7 +1008,7 @@ full_remove(){
     echo -e "${RED}${BOLD}ВНИМАНИЕ!${NC} Это полностью удалит Gateway и сбросит сеть."
     echo
     echo "Будут удалены/сброшены:"
-    echo "  • Mihomo / MetaCubeXD"
+    echo "  • Mihomo / Zashboard"
     echo "  • Docker Engine и связанные пакеты"
     echo "  • nftables, IPv4 forwarding"
     echo "  • dnsmasq / DHCP"
