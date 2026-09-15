@@ -18,7 +18,7 @@ flowchart TB
         subgraph DK["🐳 Docker"]
             direction TB
             MH["Mihomo"]
-            MC["MetaCubeX 🎛"]
+            MC["Zashboard 🎛"]
             MH --> MC
         end
 
@@ -74,7 +74,7 @@ mihomo-gateway/
 - 🔌 Определяет **WAN/LAN** интерфейсы
 - ⚙️ Настраивает **Netplan**, **dnsmasq**, forwarding и **nftables**
 - 🐳 Ставит **Docker**
-- ▶️ Запускает и управляет **Mihomo** + **MetaCubeXD**
+- ▶️ Запускает и управляет **Mihomo** + **Zashboard**
 - 📊 Даёт меню: диагностика, настройки, удаление, восстановление сети
 
 ---
