@@ -1457,24 +1457,19 @@ pppoe_status_block(){
 # ── меню ─────────────────────────────────────────────────────────────
 pppoe_menu(){
     while true; do
-        header "НАСТРОЙКИ · WAN / PPPoE"
+        header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · PPPoE"
         pppoe_status_block
         echo
-        echo "  1) Включить PPPoE"
-        echo "  2) Выключить PPPoE (вернуть WAN на DHCP)"
-        echo "  3) Изменить логин и пароль"
-        echo "  4) Авто-откат на DHCP после инициализации"
-        echo "  5) Число попыток первого подключения (${PPPOE_ATTEMPTS})"
-        echo "  6) Проверить подключение сейчас"
-        echo "  7) Журнал PPPoE (последние 50 строк)"
+        echo "  1) Изменить логин и пароль"
+        echo "  2) Авто-откат на DHCP после инициализации"
+        echo "  3) Число попыток первого подключения (${PPPOE_ATTEMPTS})"
+        echo "  4) Проверить подключение сейчас"
         echo "  0) Назад"
         echo
         local c v
-        read -rp "Выбор [0-7]: " c || return 0
+        read -rp "Выбор [0-4]: " c || return 0
         case "$c" in
-            1) pppoe_enable || warn "PPPoE не включён." ;;
-            2) pppoe_disable || warn "Не удалось вернуть DHCP." ;;
-            3) if pppoe_prompt_credentials; then
+            1) if pppoe_prompt_credentials; then
                    pppoe_write_peer
                    if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
                        confirm "Переподключить PPPoE с новыми данными?" && {
@@ -1483,7 +1478,7 @@ pppoe_menu(){
                        }
                    fi
                fi ;;
-            4) if [[ "${PPPOE_AUTO_ROLLBACK:-0}" == 1 ]]; then
+            2) if [[ "${PPPOE_AUTO_ROLLBACK:-0}" == 1 ]]; then
                    PPPOE_AUTO_ROLLBACK=0; write_config; pppoe_sync_watchdog
                    success "Авто-откат выключен — при сбоях система остаётся на PPPoE."
                else
@@ -1499,7 +1494,7 @@ pppoe_menu(){
                    [[ -f "${PPPOE_HELPER_DIR}/pppoe-watchdog.sh" ]] || pppoe_write_watchdog
                    pppoe_sync_watchdog
                fi ;;
-            5) read -rp "Число попыток первого подключения [${PPPOE_ATTEMPTS}]: " v || v=""
+            3) read -rp "Число попыток первого подключения [${PPPOE_ATTEMPTS}]: " v || v=""
                if [[ -n "$v" ]]; then
                    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 50 )); then
                        PPPOE_ATTEMPTS="$v"; write_config; success "Сохранено: ${PPPOE_ATTEMPTS} попыток."
@@ -1507,14 +1502,13 @@ pppoe_menu(){
                        warn "Нужно число 1–50."
                    fi
                fi ;;
-            6) if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+            4) if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
                    pppoe_link_ok && success "Сессия PPPoE активна: $(iface_ipv4 "$PPPOE_IFACE")" \
                                  || error "Сессия PPPoE не установлена."
                else
                    wan_link_ok && success "WAN (DHCP): $(iface_ipv4 wan)" || error "WAN без адреса."
                fi
                internet_ok && success "Интернет доступен." || error "Интернета нет." ;;
-            7) journalctl -u "$PPPOE_SERVICE" -n 50 --no-pager 2>/dev/null | less -R || warn "Журнал недоступен." ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
         esac
@@ -2122,30 +2116,28 @@ nat_menu(){
     done
 }
 
-interfaces_menu(){
-    header "НАСТРОЙКИ · ИНТЕРФЕЙСЫ"
-    echo "Текущие: LAN=${LAN_IFACE:-—} (${LAN_MAC:-—}), WAN=${WAN_IFACE:-—} (${WAN_MAC:-—})"
+change_lan_iface(){
+    header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · LAN · ИНТЕРФЕЙС"
+    echo "Текущий LAN интерфейс: ${LAN_IFACE:-—} (${LAN_MAC:-—})"
     echo
-    echo "  1) Изменить LAN интерфейс"
-    echo "  2) Изменить WAN интерфейс"
-    echo "  0) Назад"
+    local new
+    new=$(choose_iface_manual "Выберите новый LAN" "$WAN_IFACE") || return 0
+    LAN_IFACE="$new"; LAN_MAC=$(mac_of "$new")
+    if confirm "Применить? SSH может оборваться."; then
+        apply_generated || { warn "Не применено."; load_config || true; }
+    else load_config || true; fi
+}
+
+change_wan_iface(){
+    header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · WAN · ИНТЕРФЕЙС"
+    echo "Текущий WAN интерфейс: ${WAN_IFACE:-—} (${WAN_MAC:-—})"
     echo
-    local c new
-    read -rp "Выбор [0-2]: " c || return 0
-    case "$c" in
-        1) new=$(choose_iface_manual "Выберите новый LAN" "$WAN_IFACE") || return 0
-           LAN_IFACE="$new"; LAN_MAC=$(mac_of "$new")
-           if confirm "Применить? SSH может оборваться."; then
-               apply_generated || { warn "Не применено."; load_config || true; }
-           else load_config || true; fi ;;
-        2) new=$(choose_iface_manual "Выберите новый WAN" "$LAN_IFACE") || return 0
-           WAN_IFACE="$new"; WAN_MAC=$(mac_of "$new")
-           if confirm "Применить?"; then
-               apply_generated || { warn "Не применено."; load_config || true; }
-           else load_config || true; fi ;;
-        0) return 0 ;;
-        *) warn "Неверный выбор." ;;
-    esac
+    local new
+    new=$(choose_iface_manual "Выберите новый WAN" "$LAN_IFACE") || return 0
+    WAN_IFACE="$new"; WAN_MAC=$(mac_of "$new")
+    if confirm "Применить?"; then
+        apply_generated || { warn "Не применено."; load_config || true; }
+    else load_config || true; fi
 }
 
 dns_menu(){
@@ -2170,23 +2162,43 @@ dns_menu(){
     fi
 }
 
+# ─────────────────────────── установка / удаление ─────────────────────
+install_menu(){
+    while true; do
+        header "УСТАНОВКА / УДАЛЕНИЕ"
+        echo "  1) Установить / переустановить Gateway"
+        echo "  2) Удалить Gateway"
+        echo "  3) Удалить полностью"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-3]: " c || return 0
+        case "$c" in
+            1) if ! install_stack; then error "Установка завершилась с ошибкой."; fi ;;
+            2) if ! remove_stack; then error "Удаление завершилось с ошибкой."; fi ;;
+            3) if ! full_remove; then error "Удаление завершилось с ошибкой."; fi ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+# ─────────────────────────── сервисы и контейнеры ──────────────────────
 services_menu(){
     while true; do
         header "СЕРВИСЫ И КОНТЕЙНЕРЫ"
         if stack_present; then
-            echo "  1) Перезапустить стек (up -d)"
+            echo "  1) Перезапустить контейнеры"
             echo "  2) Остановить контейнеры"
-            echo "  3) Обновить образы (pull + up -d)"
-            echo "  4) Логи Mihomo (последние 100)"
-            echo "  5) Логи Zashboard (последние 100)"
-            echo "  6) Перезапустить dnsmasq / nftables"
+            echo "  3) Обновить контейнеры"
+            echo "  4) Перезапустить dnsmasq / nftables"
         else
-            warn "Стек не установлен — доступен только пункт 6."
-            echo "  6) Перезапустить dnsmasq / nftables"
+            warn "Стек не установлен — доступен только пункт 4."
+            echo "  4) Перезапустить dnsmasq / nftables"
         fi
         echo "  0) Назад"
         echo
-        local c; read -rp "Выбор [0-6]: " c || return 0
+        local c; read -rp "Выбор [0-4]: " c || return 0
         case "$c" in
             1) stack_present && restart_stack || error "Стек не установлен." ;;
             2) stack_present && { compose stop && success "Контейнеры остановлены."; } || error "Стек не установлен." ;;
@@ -2194,9 +2206,7 @@ services_menu(){
                    run_timed "Обновление образов" bash -c "cd '$PROJECT_DIR' && docker compose pull" \
                        && restart_stack
                else error "Стек не установлен."; fi ;;
-            4) docker logs --tail 100 "$MIHOMO_CONTAINER" 2>&1 | less -R || true ;;
-            5) docker logs --tail 100 "$ZASHBOARD_CONTAINER" 2>&1 | less -R || true ;;
-            6) systemctl restart dnsmasq && success "dnsmasq перезапущен." || error "Ошибка dnsmasq."
+            4) systemctl restart dnsmasq && success "dnsmasq перезапущен." || error "Ошибка dnsmasq."
                systemctl restart nftables && success "nftables перезапущен." || error "Ошибка nftables." ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
@@ -2205,31 +2215,200 @@ services_menu(){
     done
 }
 
-setting_row(){ printf "  ${BOLD}%s)${NC} %s ${DIM}%s${NC}\n" "$1" "$(pad "$2" 26)" "${3:-—}"; }
-
-settings_menu(){
+# ─────────────────────────────── диагностика ───────────────────────────
+logs_menu(){
     while true; do
-        header "НАСТРОЙКИ"
-        setting_row 1 "Подписка Mihomo"      "${SUBSCRIPTION_URL:+задана}"
-        setting_row 2 "Пароль Mihomo API"    "${CLASH_SECRET:+задан}"
-        setting_row 3 "LAN / адрес шлюза"    "${LAN_IP}/24"
-        setting_row 4 "DHCP / пул адресов"   "${DHCP_START}–${DHCP_END}"
-        setting_row 5 "NAT"                  "$([[ "$NAT_ENABLED" == 1 ]] && echo включён || echo выключен)"
-        setting_row 6 "Интерфейсы LAN / WAN" "${LAN_IFACE:-—} / ${WAN_IFACE:-—}"
-        setting_row 7 "DNS upstream"         "${DNS1}, ${DNS2}"
-        setting_row 8 "WAN / PPPoE"          "$([[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo "PPPoE ($(mask_secret "$PPPOE_USER"))" || echo DHCP)"
+        header "ДИАГНОСТИКА · ЛОГИ"
+        echo "  1) Логи Mihomo"
+        echo "  2) Логи Zashboard"
+        echo "  3) Логи PPPoE"
         echo "  0) Назад"
         echo
-        local c; read -rp "Выбор [0-8]: " c || return 0
+        local c; read -rp "Выбор [0-3]: " c || return 0
+        case "$c" in
+            1) docker logs --tail 100 "$MIHOMO_CONTAINER" 2>&1 | less -R || true ;;
+            2) docker logs --tail 100 "$ZASHBOARD_CONTAINER" 2>&1 | less -R || true ;;
+            3) journalctl -u "$PPPOE_SERVICE" -n 50 --no-pager 2>/dev/null | less -R || warn "Журнал недоступен." ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+diagnostics_menu(){
+    while true; do
+        header "ДИАГНОСТИКА"
+        echo "  1) Статусы"
+        echo "  2) Логи"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) clear; if ! full_diagnostics; then error "Ошибка диагностики."; fi; press_enter ;;
+            2) logs_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+setting_row(){ printf "  ${BOLD}%s)${NC} %s ${DIM}%s${NC}\n" "$1" "$(pad "$2" 26)" "${3:-—}"; }
+
+# ─────────────────────────────── настройки · mihomo ────────────────────
+mihomo_settings_menu(){
+    while true; do
+        header "НАСТРОЙКИ · MIHOMO"
+        setting_row 1 "Подписка" "${SUBSCRIPTION_URL:+задана}"
+        setting_row 2 "Пароль"   "${CLASH_SECRET:+задан}"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
         case "$c" in
             1) subscription_menu ;;
             2) password_menu ;;
-            3) if ! lan_menu; then warn "Операция прервана."; fi; press_enter ;;
-            4) if ! dhcp_menu; then warn "Операция прервана."; fi; press_enter ;;
-            5) nat_menu ;;
-            6) if ! interfaces_menu; then warn "Операция прервана."; fi; press_enter ;;
-            7) if ! dns_menu; then warn "Операция прервана."; fi; press_enter ;;
-            8) pppoe_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────── настройки · сеть ──────────────────────
+wan_mode_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · WAN · РЕЖИМ РАБОТЫ"
+        echo "Текущий режим: $([[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo PPPoE || echo DHCP)"
+        echo
+        echo "  1) DHCP"
+        echo "  2) PPPoE"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+                   pppoe_disable || warn "Не удалось вернуть DHCP."
+               else
+                   info "WAN уже в режиме DHCP."
+               fi ;;
+            2) if [[ "${WAN_MODE:-dhcp}" == pppoe ]]; then
+                   info "WAN уже в режиме PPPoE."
+               else
+                   pppoe_enable || warn "PPPoE не включён."
+               fi ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+wan_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · WAN"
+        echo "Интерфейс: ${WAN_IFACE:-—} (${WAN_MAC:-—})    Режим: $([[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo PPPoE || echo DHCP)"
+        echo
+        echo "  1) Изменить интерфейс"
+        echo "  2) Режим работы"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) change_wan_iface; press_enter ;;
+            2) wan_mode_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+lan_settings_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ · LAN"
+        echo "Интерфейс: ${LAN_IFACE:-—} (${LAN_MAC:-—})    Адрес: ${LAN_IP}/24    DHCP: ${DHCP_START}–${DHCP_END}"
+        echo
+        echo "  1) Изменить интерфейс"
+        echo "  2) Изменить адрес шлюза"
+        echo "  3) Пул адресов DHCP"
+        echo "  4) DNS"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-4]: " c || return 0
+        case "$c" in
+            1) change_lan_iface; press_enter ;;
+            2) if ! lan_menu; then warn "Операция прервана."; fi; press_enter ;;
+            3) if ! dhcp_menu; then warn "Операция прервана."; fi; press_enter ;;
+            4) if ! dns_menu; then warn "Операция прервана."; fi; press_enter ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+interfaces_root_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · ИНТЕРФЕЙСЫ"
+        echo "LAN: ${LAN_IFACE:-—}    WAN: ${WAN_IFACE:-—} ($([[ "${WAN_MODE:-dhcp}" == pppoe ]] && echo PPPoE || echo DHCP))"
+        echo
+        echo "  1) WAN"
+        echo "  2) LAN"
+        echo "  3) PPPoE"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-3]: " c || return 0
+        case "$c" in
+            1) wan_menu ;;
+            2) lan_settings_menu ;;
+            3) pppoe_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+firewall_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · FIREWALL"
+        echo "  1) NAT"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-1]: " c || return 0
+        case "$c" in
+            1) nat_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+network_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ"
+        echo "  1) Интерфейсы"
+        echo "  2) Firewall"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) interfaces_root_menu ;;
+            2) firewall_menu ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+    done
+}
+
+# ─────────────────────────────── настройки ──────────────────────────────
+settings_menu(){
+    while true; do
+        header "НАСТРОЙКИ"
+        setting_row 1 "Mihomo" "подписка, пароль"
+        setting_row 2 "Сеть"   "интерфейсы, firewall"
+        echo "  0) Назад"
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) mihomo_settings_menu ;;
+            2) network_menu ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -2252,25 +2431,21 @@ main_menu(){
         quick_status
         echo
         echo -e "${BOLD}${CYAN}${LINE}${NC}"
-        menu_item 1 "Установить / переустановить Gateway" "полный цикл"
-        menu_item 2 "Сервисы и контейнеры"                "перезапуск, логи, обновление"
-        menu_item 3 "Настройки"                           "подписка, LAN, DHCP, NAT, DNS"
-        menu_item 4 "Диагностика и статусы"               "подробный отчёт"
-        menu_item 5 "Удалить Gateway"                     "сеть оставить"
-        menu_item 6 "Полное удаление"                     "сброс сети"
-        menu_item 0 "Выход"                               ""
+        menu_item 1 "Установка / удаление"  "установить, удалить, снести полностью"
+        menu_item 2 "Сервисы и контейнеры"  "перезапуск, остановка, обновление"
+        menu_item 3 "Диагностика"           "статусы, логи"
+        menu_item 4 "Настройки"             "mihomo, сеть"
+        menu_item 0 "Выход"                 ""
         echo -e "${BOLD}${CYAN}${LINE}${NC}"
         echo -e "  ${DIM}Панель: http://${LAN_IP}/     API: http://${LAN_IP}:9090${NC}"
         echo
 
-        read -rp "$(echo -e "${BOLD}Выбор [0-6]: ${NC}")" c || exit 0
+        read -rp "$(echo -e "${BOLD}Выбор [0-4]: ${NC}")" c || exit 0
         case "$c" in
-            1) if ! install_stack; then error "Установка завершилась с ошибкой."; fi; press_enter ;;
+            1) install_menu ;;
             2) services_menu ;;
-            3) settings_menu ;;
-            4) clear; if ! full_diagnostics; then error "Ошибка диагностики."; fi; press_enter ;;
-            5) if ! remove_stack; then error "Удаление завершилось с ошибкой."; fi; press_enter ;;
-            6) if ! full_remove; then error "Удаление завершилось с ошибкой."; fi; press_enter ;;
+            3) diagnostics_menu ;;
+            4) settings_menu ;;
             0|q|Q|й|Й) echo; exit 0 ;;
             *) warn "Неверный выбор."; sleep 1 ;;
         esac
