@@ -112,6 +112,7 @@ pad(){
 }
 
 header(){
+    clear
     echo
     echo -e "${BOLD}${CYAN}${LINE}${NC}"
     echo -e "${BOLD}${CYAN}  $1${NC}"
