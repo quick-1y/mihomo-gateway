@@ -20,6 +20,8 @@ readonly NETPLAN_FILE="/etc/netplan/01-gateway.yaml"
 readonly DNSMASQ_FILE="/etc/dnsmasq.conf"
 readonly DNSMASQ_OVERRIDE="/etc/systemd/system/dnsmasq.service.d/override.conf"
 readonly NFT_FILE="/etc/nftables.conf"
+readonly PORTFWD_FILE="${STATE_DIR}/portforward.list"
+readonly WANACCESS_FILE="${STATE_DIR}/wan-block.list"
 
 # PPPoE
 readonly PPPOE_PEER_NAME="mihomo-gateway"
@@ -565,17 +567,82 @@ EOF2
 }
 
 # ─────────────────────────────── nftables ────────────────────────────
+# WAN-facing access control for the gateway's OWN services (input chain).
+# One "blocked from WAN" entry per line: <tcp|udp> <port> <label>
+# Everything NOT listed here stays reachable from WAN (input policy is
+# accept) — SSH included, matching today's real behavior. Blocking SSH (or
+# anything else) from WAN is just adding a row here through the menu, the
+# same way any other port is blocked; there is no separate SSH switch.
+wanaccess_seed_defaults(){
+    [[ -f "$WANACCESS_FILE" ]] && return 0
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    # Seeds exactly the ports this gateway has always protected, so an
+    # upgrade from a version without this file changes nothing on disk.
+    cat > "$WANACCESS_FILE" <<'EOF2'
+tcp 80 Zashboard
+tcp 7890 Mihomo-proxy
+udp 7890 Mihomo-proxy
+tcp 9090 Mihomo-API
+tcp 53 DNS
+udp 53 DNS
+EOF2
+    chmod 600 "$WANACCESS_FILE"
+}
+
+wanaccess_input_rules(){
+    wanaccess_seed_defaults
+    local proto port label
+    while read -r proto port label; do
+        [[ -z "$proto" ]] && continue
+        printf '    iifname { "wan", "%s" } %s dport %s drop\n' "$PPPOE_IFACE" "$proto" "$port"
+    done < "$WANACCESS_FILE"
+}
+
+wanaccess_count(){ [[ -s "$WANACCESS_FILE" ]] && grep -c . "$WANACCESS_FILE" || echo 0; }
+
+wanaccess_print_table(){
+    wanaccess_seed_defaults
+    if [[ ! -s "$WANACCESS_FILE" ]]; then
+        echo "  Заблокированных портов нет — все сервисы gateway доступны с WAN."
+        return 0
+    fi
+    local i=0 proto port label
+    while read -r proto port label; do
+        [[ -z "$proto" ]] && continue
+        i=$((i+1))
+        printf '  %s) %-4s порт %-6s заблокирован — %s\n' "$i" "${proto^^}" "$port" "${label:-без описания}"
+    done < "$WANACCESS_FILE"
+}
+
+# Port-forward (DNAT) rules live in PORTFWD_FILE, one per line:
+#   <tcp|udp> <wan_port> <lan_ip> <lan_port>
+portfwd_dnat_rules(){
+    [[ -s "$PORTFWD_FILE" ]] || return 0
+    local proto wport lip lport
+    while read -r proto wport lip lport; do
+        [[ -z "$proto" ]] && continue
+        printf '    iifname { "wan", "%s" } %s dport %s dnat to %s:%s\n' \
+            "$PPPOE_IFACE" "$proto" "$wport" "$lip" "$lport"
+    done < "$PORTFWD_FILE"
+}
+
 write_nftables(){
     local out; out="$(wan_out_iface)"     # wan in DHCP mode, ppp0 in PPPoE mode
+    local dnat_rules; dnat_rules="$(portfwd_dnat_rules)"
+
     local nat_block=""
-    if [[ "$NAT_ENABLED" == "1" ]]; then
+    if [[ "$NAT_ENABLED" == "1" || -n "$dnat_rules" ]]; then
         nat_block=$(cat <<EOF2
 
 table ip gateway_nat {
+$( [[ "$NAT_ENABLED" == "1" ]] && cat <<EOF3
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "${out}" ip saddr $(subnet_of "$LAN_IP").0/24 masquerade
   }
+EOF3
+)
+$( [[ -n "$dnat_rules" ]] && printf '  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n%s\n  }\n' "$dnat_rules" )
 }
 EOF2
         )
@@ -587,19 +654,17 @@ EOF2
 table inet gateway_filter {
   chain input {
     type filter hook input priority filter; policy accept;
-    iifname { "wan", "${PPPOE_IFACE}" } tcp dport { 80, 7890, 9090 } drop
-    iifname { "wan", "${PPPOE_IFACE}" } udp dport { 53, 7890 } drop
-    iifname { "wan", "${PPPOE_IFACE}" } tcp dport 53 drop
+$(wanaccess_input_rules)
   }
 
   chain forward {
-    type filter hook forward priority filter; policy accept;
-$( [[ "$NAT_ENABLED" == "1" ]] && cat <<EOF3
-    iifname "lan" oifname "${out}" accept
-    iifname "${out}" oifname "lan" ct state established,related accept
-    oifname "${out}" tcp flags syn tcp option maxseg size set rt mtu
-EOF3
-)
+    type filter hook forward priority filter; policy drop;
+    ct state invalid drop
+    ct state established,related accept
+    iifname "lan" accept
+    ct status dnat accept
+    oifname { "wan", "${PPPOE_IFACE}" } tcp flags syn tcp option maxseg size set rt mtu
+    iifname { "wan", "${PPPOE_IFACE}" } tcp flags syn tcp option maxseg size set rt mtu
   }
 }
 ${nat_block}
@@ -609,10 +674,33 @@ EOF2
 
 reload_nftables(){
     nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables."; return 1; }
-    # Old tables must go, otherwise disabled NAT rules would survive the reload.
+    # Old tables must go first: nft -f only ever *adds* rules to an existing
+    # table/chain, so re-applying without a delete would duplicate every
+    # input/forward/NAT rule on each toggle (NAT, port-forward add/remove...).
+    nft delete table inet gateway_filter 2>/dev/null || true
     nft delete table ip gateway_nat 2>/dev/null || true
     nft -f "$NFT_FILE" || return 1
+    # Loading rules this way bypasses systemd entirely, so if the firewall
+    # was previously turned off via the menu, applying any change here also
+    # implies "keep enforcing this on reboot" — re-enable the unit to match.
+    systemctl enable nftables >/dev/null 2>&1 || true
     return 0
+}
+
+portfwd_count(){ [[ -s "$PORTFWD_FILE" ]] && grep -c . "$PORTFWD_FILE" || echo 0; }
+
+portfwd_print_table(){
+    if [[ ! -s "$PORTFWD_FILE" ]]; then
+        echo "  Правил нет."
+        return 0
+    fi
+    local wan_ip; wan_ip="$(iface_ipv4 "$(wan_out_iface)")"; wan_ip="${wan_ip:-<WAN-IP>}"
+    local i=0 proto wport lip lport
+    while read -r proto wport lip lport; do
+        [[ -z "$proto" ]] && continue
+        i=$((i+1))
+        printf '  %s) %-4s %s:%s → %s:%s\n' "$i" "${proto^^}" "$wan_ip" "$wport" "$lip" "$lport"
+    done < "$PORTFWD_FILE"
 }
 
 configure_nftables(){
@@ -1658,6 +1746,13 @@ quick_status(){
         status_row "NAT" off
     fi
 
+    local pf; pf="$(portfwd_count)"
+    if (( pf > 0 )); then
+        status_row "DNAT" ok "${pf} правил(о) проброса портов"
+    else
+        status_row "DNAT" skip
+    fi
+
     if systemctl is-active --quiet docker 2>/dev/null; then
         docker_ok=1; status_row "Docker" ok
     else
@@ -1732,8 +1827,11 @@ full_diagnostics(){
         echo -e "  Состояние:  ${YELLOW}выключен${NC}"
     fi
     echo "  LAN → WAN:  $(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
+    echo "  Проброс портов (DNAT): $(portfwd_count) правил(о) — подробнее: Настройки → Сеть → Firewall → Статус"
 }
 
+# Identifies the single active filtering mechanism and dumps the live
+# ruleset, so "what actually blocks/allows this port" has one answer.
 # ─────────────────────────────── установка ───────────────────────────
 stack_present(){ [[ -f "$COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; }
 
@@ -2080,41 +2178,172 @@ dhcp_menu(){
     fi
 }
 
-nat_menu(){
+portfwd_menu(){
     while true; do
-        header "НАСТРОЙКИ · NAT"
-        echo "LAN: $(subnet_of "$LAN_IP").0/24 → WAN: ${WAN_IFACE:-wan}"
-        if [[ "$NAT_ENABLED" == 1 ]]; then
-            echo -e "Состояние: ${GREEN}ВКЛЮЧЁН${NC}"
-        else
-            echo -e "Состояние: ${YELLOW}ВЫКЛЮЧЕН${NC}"
-        fi
+        header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ПРОБРОС ПОРТОВ"
+        echo "Проброс порта с WAN на устройство в LAN (DNAT), например:"
+        echo "  92.54.78.221:8265 → 192.168.1.100:8265"
         echo
-        echo "  1) Включить NAT"
-        echo "  2) Выключить NAT"
-        echo "  3) Пересоздать правила"
-        echo "  0) Назад"
+        portfwd_print_table
         echo
-        local c old="$NAT_ENABLED"
-        read -rp "Выбор [0-3]: " c || return 0
+        menu_item 1 "Добавить правило" "пробросить порт с WAN на устройство LAN"
+        menu_item 2 "Удалить правило"  "убрать существующий проброс порта"
+        menu_item 0 "Назад" ""
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
         case "$c" in
-            1|2)
-                [[ "$c" == 1 ]] && NAT_ENABLED=1 || NAT_ENABLED=0
-                write_nftables
-                if reload_nftables; then
-                    write_config
-                    [[ "$NAT_ENABLED" == 1 ]] && success "NAT включён." || success "NAT выключен."
-                else
-                    NAT_ENABLED="$old"; write_nftables; reload_nftables || true
-                    error "Не удалось изменить NAT."
-                fi ;;
-            3)  write_nftables
-                reload_nftables && success "Правила NAT пересозданы." || error "Ошибка правил NAT." ;;
-            0)  return 0 ;;
-            *)  warn "Неверный выбор."; continue ;;
+            1) portfwd_add_interactive ;;
+            2) portfwd_remove_interactive ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
         esac
         press_enter
     done
+}
+
+portfwd_add_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ПРОБРОС ПОРТОВ · ДОБАВИТЬ"
+    local proto wport lip lport
+    read -rp "Протокол [tcp/udp/both] (tcp): " proto || return 0
+    proto="${proto:-tcp}"; proto="${proto,,}"
+    [[ "$proto" == tcp || "$proto" == udp || "$proto" == both ]] || { error "Протокол: tcp, udp или both."; return 0; }
+
+    read -rp "Внешний (WAN) порт: " wport || return 0
+    [[ "$wport" =~ ^[0-9]+$ ]] && (( wport >= 1 && wport <= 65535 )) || { error "Порт должен быть 1-65535."; return 0; }
+
+    read -rp "LAN IP устройства: " lip || return 0
+    is_ipv4 "$lip" || { error "Некорректный IPv4-адрес."; return 0; }
+    same_subnet "$lip" "$LAN_IP" || { error "IP вне подсети LAN ($(subnet_of "$LAN_IP").0/24)."; return 0; }
+
+    read -rp "Порт на устройстве [${wport}]: " lport || return 0
+    lport="${lport:-$wport}"
+    [[ "$lport" =~ ^[0-9]+$ ]] && (( lport >= 1 && lport <= 65535 )) || { error "Порт должен быть 1-65535."; return 0; }
+
+    local protos=("$proto"); [[ "$proto" == both ]] && protos=(tcp udp)
+    local p
+    for p in "${protos[@]}"; do
+        if grep -qE "^${p} ${wport} " "$PORTFWD_FILE" 2>/dev/null; then
+            error "Внешний порт ${wport}/${p} уже занят другим правилом."
+            return 0
+        fi
+    done
+
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    for p in "${protos[@]}"; do
+        printf '%s %s %s %s\n' "$p" "$wport" "$lip" "$lport" >> "$PORTFWD_FILE"
+    done
+    chmod 600 "$PORTFWD_FILE"
+
+    write_nftables
+    if reload_nftables; then
+        local wan_ip; wan_ip="$(iface_ipv4 "$(wan_out_iface)")"; wan_ip="${wan_ip:-<WAN-IP>}"
+        success "Правило добавлено: ${wan_ip}:${wport} → ${lip}:${lport} (${proto})"
+    else
+        error "Не удалось применить nftables — правило сохранено, но не активно."
+    fi
+}
+
+portfwd_remove_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ПРОБРОС ПОРТОВ · УДАЛИТЬ"
+    portfwd_print_table
+    [[ -s "$PORTFWD_FILE" ]] || return 0
+    echo
+    local n; read -rp "Номер правила для удаления (0 — отмена): " n || return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || { error "Введите число."; return 0; }
+    (( n == 0 )) && return 0
+    local total; total=$(portfwd_count)
+    (( n >= 1 && n <= total )) || { error "Нет правила №${n}."; return 0; }
+
+    local tmp; tmp=$(mktemp "${STATE_DIR}/.portfwd.XXXXXX")
+    sed "${n}d" "$PORTFWD_FILE" > "$tmp" && mv "$tmp" "$PORTFWD_FILE"
+    chmod 600 "$PORTFWD_FILE"
+
+    write_nftables
+    if reload_nftables; then
+        success "Правило №${n} удалено."
+    else
+        error "Не удалось применить nftables после удаления."
+    fi
+}
+
+wanaccess_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN"
+        echo "Порты самого gateway, закрытые от прямого доступа из интернета."
+        echo "Всё, чего нет в списке (включая SSH), остаётся доступным с WAN."
+        echo
+        wanaccess_print_table
+        echo
+        menu_item 1 "Заблокировать порт"   "закрыть порт gateway от доступа с WAN"
+        menu_item 2 "Разблокировать порт"  "снова открыть порт для доступа с WAN"
+        menu_item 0 "Назад" ""
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) wanaccess_add_interactive ;;
+            2) wanaccess_remove_interactive ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+wanaccess_add_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · ЗАБЛОКИРОВАТЬ ПОРТ"
+    wanaccess_seed_defaults
+    local proto port label
+    read -rp "Протокол [tcp/udp] (tcp): " proto || return 0
+    proto="${proto:-tcp}"; proto="${proto,,}"
+    [[ "$proto" == tcp || "$proto" == udp ]] || { error "Протокол: tcp или udp."; return 0; }
+
+    read -rp "Порт: " port || return 0
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { error "Порт должен быть 1-65535."; return 0; }
+
+    if grep -qE "^${proto} ${port} " "$WANACCESS_FILE" 2>/dev/null; then
+        warn "Порт ${port}/${proto} уже заблокирован для WAN."
+        return 0
+    fi
+
+    read -rp "Название (для памяти, необязательно): " label || return 0
+    label="${label:-без описания}"
+
+    printf '%s %s %s\n' "$proto" "$port" "$label" >> "$WANACCESS_FILE"
+    chmod 600 "$WANACCESS_FILE"
+
+    write_nftables
+    if reload_nftables; then
+        success "Порт ${port}/${proto} заблокирован для WAN."
+    else
+        error "Не удалось применить nftables — правило сохранено, но не активно."
+    fi
+}
+
+wanaccess_remove_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · РАЗБЛОКИРОВАТЬ ПОРТ"
+    wanaccess_print_table
+    [[ -s "$WANACCESS_FILE" ]] || return 0
+    echo
+    local n; read -rp "Номер правила для разблокировки (0 — отмена): " n || return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || { error "Введите число."; return 0; }
+    (( n == 0 )) && return 0
+    local total; total=$(wanaccess_count)
+    (( n >= 1 && n <= total )) || { error "Нет правила №${n}."; return 0; }
+
+    local entry; entry=$(sed -n "${n}p" "$WANACCESS_FILE")
+    warn "Порт будет ОТКРЫТ для доступа из интернета: ${entry}"
+    confirm "Точно разблокировать этот порт для WAN?" || return 0
+
+    local tmp; tmp=$(mktemp "${STATE_DIR}/.wanaccess.XXXXXX")
+    sed "${n}d" "$WANACCESS_FILE" > "$tmp" && mv "$tmp" "$WANACCESS_FILE"
+    chmod 600 "$WANACCESS_FILE"
+
+    write_nftables
+    if reload_nftables; then
+        success "Порт разблокирован для WAN."
+    else
+        error "Не удалось применить nftables после изменения."
+    fi
 }
 
 change_lan_iface(){
@@ -2189,15 +2418,15 @@ services_menu(){
     while true; do
         header "СЕРВИСЫ И КОНТЕЙНЕРЫ"
         if stack_present; then
-            echo "  1) Перезапустить контейнеры"
-            echo "  2) Остановить контейнеры"
-            echo "  3) Обновить контейнеры"
-            echo "  4) Перезапустить dnsmasq / nftables"
+            menu_item 1 "Перезапустить контейнеры"        "docker compose up -d"
+            menu_item 2 "Остановить контейнеры"            "docker compose stop"
+            menu_item 3 "Обновить контейнеры"               "скачать новые образы и перезапустить"
+            menu_item 4 "Перезапустить dnsmasq / nftables" "пересобрать правила и перезапустить сервисы"
         else
             warn "Стек не установлен — доступен только пункт 4."
-            echo "  4) Перезапустить dnsmasq / nftables"
+            menu_item 4 "Перезапустить dnsmasq / nftables" "пересобрать правила и перезапустить сервисы"
         fi
-        echo "  0) Назад"
+        menu_item 0 "Назад" ""
         echo
         local c; read -rp "Выбор [0-4]: " c || return 0
         case "$c" in
@@ -2208,7 +2437,8 @@ services_menu(){
                        && restart_stack
                else error "Стек не установлен."; fi ;;
             4) systemctl restart dnsmasq && success "dnsmasq перезапущен." || error "Ошибка dnsmasq."
-               systemctl restart nftables && success "nftables перезапущен." || error "Ошибка nftables." ;;
+               write_nftables
+               systemctl restart nftables && success "nftables перезапущен, правила пересозданы." || error "Ошибка nftables." ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
         esac
@@ -2369,15 +2599,70 @@ interfaces_root_menu(){
 firewall_menu(){
     while true; do
         header "НАСТРОЙКИ · СЕТЬ · FIREWALL"
-        echo "  1) NAT"
-        echo "  0) Назад"
+
+        if systemctl is-active --quiet nftables 2>/dev/null; then
+            echo -e "Firewall (nftables): ${GREEN}АКТИВЕН${NC}"
+        else
+            echo -e "Firewall (nftables): ${RED}ВЫКЛЮЧЕН${NC} — фильтрация и NAT не работают"
+        fi
         echo
-        local c; read -rp "Выбор [0-1]: " c || return 0
+        echo -e "${BOLD}ИСХОДЯЩИЙ ТРАФИК — LAN → интернет${NC}"
+        if [[ "$NAT_ENABLED" == 1 ]]; then
+            echo -e "  NAT: ${GREEN}ВКЛЮЧЕН${NC}"
+        else
+            echo -e "  NAT: ${YELLOW}ВЫКЛЮЧЕН${NC}"
+        fi
+        echo
+        echo -e "${BOLD}ВХОДЯЩИЙ ТРАФИК — интернет → WAN${NC}"
+        local ssh_state="разрешён"
+        grep -qE '^tcp 22 ' "$WANACCESS_FILE" 2>/dev/null && ssh_state="заблокирован"
+        echo "  Доступ к gateway:      $(wanaccess_count) портов заблокировано (SSH: ${ssh_state})"
+        echo "  Проброс портов на LAN: $(portfwd_count) правил(о)"
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+            echo
+            echo -e "${YELLOW}Внимание: UFW тоже активен — возможен конфликт правил.${NC}"
+        fi
+        echo
+        menu_item 1 "Включить / выключить firewall"  "полностью отключает фильтрацию и NAT"
+        menu_item 2 "NAT — доступ LAN в интернет"     "включить/выключить общий доступ в сеть"
+        menu_item 3 "Доступ к gateway с WAN"           "какие порты gateway видны снаружи (SSH и др.)"
+        menu_item 4 "Проброс портов на устройства LAN" "сделать устройство LAN доступным из интернета"
+        menu_item 0 "Назад" ""
+        echo
+        local c; read -rp "Выбор [0-4]: " c || return 0
         case "$c" in
-            1) nat_menu ;;
+            1)
+                if systemctl is-active --quiet nftables 2>/dev/null; then
+                    warn "Выключение firewall уберёт и фильтрацию, и NAT — LAN может потерять доступ в интернет."
+                    if confirm "Выключить firewall?"; then
+                        systemctl disable --now nftables >/dev/null 2>&1 \
+                            && success "Firewall выключен." || error "Не удалось выключить firewall."
+                    fi
+                else
+                    write_nftables
+                    if systemctl enable --now nftables >/dev/null 2>&1; then
+                        success "Firewall включён."
+                    else
+                        error "Не удалось включить firewall."
+                    fi
+                fi ;;
+            2)
+                local old="$NAT_ENABLED"
+                [[ "$NAT_ENABLED" == 1 ]] && NAT_ENABLED=0 || NAT_ENABLED=1
+                write_nftables
+                if reload_nftables; then
+                    write_config
+                    [[ "$NAT_ENABLED" == 1 ]] && success "NAT включён." || success "NAT выключен."
+                else
+                    NAT_ENABLED="$old"; write_nftables; reload_nftables || true
+                    error "Не удалось изменить NAT."
+                fi ;;
+            3) wanaccess_menu; continue ;;
+            4) portfwd_menu; continue ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
         esac
+        press_enter
     done
 }
 
