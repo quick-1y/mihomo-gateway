@@ -21,21 +21,13 @@ readonly DNSMASQ_FILE="/etc/dnsmasq.conf"
 readonly DNSMASQ_OVERRIDE="/etc/systemd/system/dnsmasq.service.d/override.conf"
 readonly NFT_FILE="/etc/nftables.conf"
 readonly PORTFWD_FILE="${STATE_DIR}/portforward.list"
-# Legacy block-list (pre-refactor). Kept only as a read-only reference
-# during migration to the allow-list model below — never written again.
-readonly WANACCESS_FILE="${STATE_DIR}/wan-block.list"
 readonly WAN_ALLOW_FILE="${STATE_DIR}/wan-allow.list"
 readonly LAN_ALLOW_FILE="${STATE_DIR}/lan-allow.list"
 readonly NFT_TABLE="gateway"
 readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 readonly ORIGINAL_DOCKER_DAEMON="${ORIGINAL_DIR}/daemon.json"
 readonly NFT_CONFIRM_BACKUP="${STATE_DIR}/nftables.conf.pre-confirm"
-readonly NFT_CONFIRM_SECONDS=300
-# Names of the systemd-timer-based confirm mechanism from an earlier
-# revision of this script. No longer created (see nft_confirm_or_rollback);
-# kept only so full_remove() can clean up leftovers from that revision.
-readonly NFT_CONFIRM_TIMER_NAME="gateway-fw-confirm.timer"
-readonly NFT_CONFIRM_SERVICE_NAME="gateway-fw-confirm.service"
+readonly NFT_CONFIRM_SECONDS=60
 
 # PPPoE
 readonly PPPOE_PEER_NAME="mihomo-gateway"
@@ -136,9 +128,15 @@ header(){
     echo
 }
 
+# Single y/N confirmation convention used everywhere in this script:
+# "[?] <question> [y/N]: ", default (bare Enter) is "no". The only other
+# interactive confirmation, nft_confirm_or_rollback()'s countdown, mirrors
+# this same wording/bracket/color style but reads a single keypress instead
+# of a line, because it must also enforce a timeout — that's a genuine
+# functional difference (rollback-on-timeout), not a style inconsistency.
 confirm(){
     local a
-    read -rp "$(echo -e "${YELLOW}${1:-Продолжить?} [y/N]: ${NC}")" a || return 1
+    read -rp "$(echo -e "${YELLOW}[?] ${1:-Продолжить?} [y/N]: ${NC}")" a || return 1
     [[ "$a" =~ ^([Yy]([Ee][Ss])?|[Дд]([Аа])?)$ ]]
 }
 press_enter(){ echo; read -rp "Нажмите Enter для продолжения..." _ || true; }
@@ -795,7 +793,7 @@ nft_confirm_or_rollback(){
 
     local remaining=$NFT_CONFIRM_SECONDS key answer=""
     while (( remaining > 0 )); do
-        printf '\r%s[?]%s Подтвердить изменения? [y/N]  (откат через %02d:%02d) ' \
+        printf '\r%s[?] Подтвердить изменения? [y/N]:%s (откат через %02d:%02d) ' \
             "$YELLOW" "$NC" $(( remaining / 60 )) $(( remaining % 60 ))
         if read -rsn1 -t 1 key 2>/dev/null; then
             case "$key" in
@@ -849,11 +847,6 @@ nft_apply_with_confirm(){
 wanaccess_seed_defaults(){
     [[ -f "$WAN_ALLOW_FILE" ]] && return 0
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-    if [[ -f "$WANACCESS_FILE" ]]; then
-        info "Обнаружен старый список блокировок WAN (${WANACCESS_FILE})."
-        info "Модель изменилась на allow-list (default-deny) — старый файл не переносится автоматически."
-        info "По умолчанию с WAN будут доступны SSH (22), Zashboard (80) и Mihomo API (9090)."
-    fi
     cat > "$WAN_ALLOW_FILE" <<'EOF2'
 tcp 22 SSH
 tcp 80 Zashboard
@@ -1298,7 +1291,6 @@ mask_secret(){
 
 iface_ipv4(){ ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
 default_gw_via(){ ip -4 route show default 2>/dev/null | awk -v d="$1" '$0 ~ ("dev "d)  {print $3; exit}'; }
-default_dev(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
 
 internet_ok(){
     ping -c1 -W2 -n 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -1315,7 +1307,6 @@ pppoe_link_ok(){
     ip -4 route show default 2>/dev/null | grep -q "dev ${PPPOE_IFACE}" || return 1
     return 0
 }
-pppoe_session_ok(){ pppoe_link_ok && internet_ok; }
 
 wan_link_ok(){
     [[ -n "$(iface_ipv4 wan)" ]] || return 1
@@ -2001,10 +1992,6 @@ network_is_ready(){
     [[ -f "$CONFIG_FILE" ]]  || return 1
     [[ -f "$NETPLAN_FILE" ]] || return 1
     [[ -n "$LAN_MAC" && -n "$WAN_MAC" ]] || return 1
-    if [[ ! -f "$NETWORK_MARKER" ]]; then
-        # Migration for setups made by earlier versions of this script.
-        echo "NETWORK_CONFIGURED=1" > "$NETWORK_MARKER"
-    fi
     return 0
 }
 
@@ -2150,7 +2137,7 @@ full_diagnostics(){
     echo "  URL:        http://${LAN_IP}/"
     check_ui && echo -e "  Проверка:   ${GREEN}OK${NC}" || echo -e "  Проверка:   ${RED}FAIL${NC}"
     echo
-    echo -e "${BOLD}FIREWALL / NAT (nftables — единственный владелец, таблица inet ${NFT_TABLE})${NC}"
+    echo -e "${BOLD}FIREWALL / NAT (таблица inet ${NFT_TABLE})${NC}"
     if [[ "$NAT_ENABLED" == 1 ]]; then
         echo -e "  NAT:                    ${GREEN}включён${NC}  $(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
     else
@@ -2169,7 +2156,7 @@ full_diagnostics(){
     echo
     echo -e "${BOLD}DOCKER — СЕТЕВАЯ МОДЕЛЬ${NC}"
     if [[ -f "$DOCKER_DAEMON_JSON" ]] && grep -q '"iptables": false' "$DOCKER_DAEMON_JSON" 2>/dev/null; then
-        echo -e "  iptables:   ${GREEN}отключён${NC} (nftables — единственный владелец firewall)"
+        echo -e "  iptables:   ${GREEN}отключён${NC}"
     else
         echo -e "  iptables:   ${YELLOW}не подтверждено — см. ${DOCKER_DAEMON_JSON}${NC}"
     fi
@@ -2385,11 +2372,7 @@ full_remove(){
     rm -rf /etc/systemd/system/dnsmasq.service.d
     systemctl daemon-reload
 
-    # Cleanup for the systemd-timer-based confirm mechanism from an earlier
-    # revision of this script (current revision uses an inline countdown
-    # instead — see nft_confirm_or_rollback() — and creates none of this).
-    systemctl disable --now "$NFT_CONFIRM_TIMER_NAME" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/${NFT_CONFIRM_TIMER_NAME}" "/etc/systemd/system/${NFT_CONFIRM_SERVICE_NAME}" "$NFT_CONFIRM_BACKUP"
+    rm -f "$NFT_CONFIRM_BACKUP"
 
     if command -v nft >/dev/null 2>&1; then
         nft delete table inet "$NFT_TABLE" 2>/dev/null || true
@@ -3041,7 +3024,7 @@ firewall_menu(){
         header "НАСТРОЙКИ · СЕТЬ · FIREWALL"
 
         if systemctl is-active --quiet nftables 2>/dev/null; then
-            echo -e "Firewall (nftables): ${GREEN}АКТИВЕН${NC}  (единственный владелец filter/NAT/DNAT — Docker его не трогает)"
+            echo -e "Firewall (nftables): ${GREEN}АКТИВЕН${NC}"
         else
             echo -e "Firewall (nftables): ${RED}ВЫКЛЮЧЕН${NC} — фильтрация и NAT не работают"
         fi
