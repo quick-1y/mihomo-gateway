@@ -27,15 +27,6 @@ readonly WANACCESS_FILE="${STATE_DIR}/wan-block.list"
 readonly WAN_ALLOW_FILE="${STATE_DIR}/wan-allow.list"
 readonly LAN_ALLOW_FILE="${STATE_DIR}/lan-allow.list"
 readonly NFT_TABLE="gateway"
-# Must match tun.auto-redirect-input-mark in mihomo/config.yaml. Traffic
-# mihomo's own auto-redirect nftables table DNATs to a local destination
-# gets re-classified by the kernel as INPUT-hook (not FORWARD) traffic, so
-# our own default-deny LAN input policy would otherwise drop every proxied
-# LAN connection — enumerating destination ports isn't possible since the
-# whole point is arbitrary internet destinations. Accepting on this mark
-# instead of a port range lets that redirected traffic through without
-# opening the LAN input chain up more broadly.
-readonly MIHOMO_REDIRECT_MARK="0x100"
 readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 readonly ORIGINAL_DOCKER_DAEMON="${ORIGINAL_DIR}/daemon.json"
 readonly NFT_CONFIRM_BACKUP="${STATE_DIR}/nftables.conf.pre-confirm"
@@ -703,13 +694,19 @@ $(nft_elements_clause "$pf_udp")
         ct state invalid drop
         iif "lo" accept
         ct state established,related accept
-        # Mihomo's own auto-redirect table DNATs matched LAN traffic to a
-        # local destination so it can proxy it; the kernel then delivers
-        # those packets via this INPUT hook instead of FORWARD. They carry
-        # this connection mark (tun.auto-redirect-input-mark in
-        # mihomo/config.yaml) regardless of destination port, which is the
-        # whole point — the real destination is arbitrary internet hosts.
-        meta mark ${MIHOMO_REDIRECT_MARK} accept
+        # Mihomo's own auto-redirect table (table inet mihomo) intercepts
+        # LAN traffic with a plain nftables "redirect to :<port>" rule — a
+        # DNAT-to-local operation. That reclassifies the packet as
+        # locally-destined, so it traverses this INPUT hook instead of
+        # FORWARD, hitting a destination port internal to mihomo (not
+        # fixed, not known to this firewall) that would otherwise fall
+        # through to the default-drop policy below. Confirmed on real
+        # hardware: mihomo's redirect/dnat rules never set any packet or
+        # connection mark, so matching on the mark this refactor originally
+        # tried (meta mark) never fires — ct status dnat is the one fact
+        # that's actually true of this traffic, and is the same signal the
+        # forward chain below already uses for WAN->LAN port-forwarding.
+        ct status dnat accept
         iifname "lan" icmp type echo-request accept
         iifname "lan" tcp dport @lan_allow_tcp accept
         iifname "lan" udp dport @lan_allow_udp accept

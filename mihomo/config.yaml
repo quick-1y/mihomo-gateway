@@ -57,17 +57,6 @@ tun:
   # forwarded traffic gets pulled into the TUN and silently dropped instead
   # of being proxied or passed through DIRECT.
   auto-redirect: true
-  # Pinned explicitly (rather than relying on whatever mihomo defaults to)
-  # so the gateway firewall can allow-list this exact mark: auto-redirect's
-  # own nftables table DNATs matched LAN traffic to a local destination for
-  # mihomo to receive, which the kernel then re-classifies as INPUT-hook
-  # (not FORWARD) traffic. The gateway's own default-deny "inet gateway"
-  # input chain has no way to enumerate every possible proxied destination
-  # port, so it instead accepts on this connection mark — see the
-  # `meta mark ${MIHOMO_REDIRECT_MARK} accept` rule in write_nft_structural()
-  # in install-gateway-docker.sh. Must stay in sync with that value.
-  auto-redirect-input-mark: 0x100
-  auto-redirect-output-mark: 0x200
   auto-detect-interface: true
   route-exclude-address:
     - __LAN_NETWORK__
