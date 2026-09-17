@@ -21,7 +21,13 @@ readonly DNSMASQ_FILE="/etc/dnsmasq.conf"
 readonly DNSMASQ_OVERRIDE="/etc/systemd/system/dnsmasq.service.d/override.conf"
 readonly NFT_FILE="/etc/nftables.conf"
 readonly PORTFWD_FILE="${STATE_DIR}/portforward.list"
-readonly WANACCESS_FILE="${STATE_DIR}/wan-block.list"
+readonly WAN_ALLOW_FILE="${STATE_DIR}/wan-allow.list"
+readonly LAN_ALLOW_FILE="${STATE_DIR}/lan-allow.list"
+readonly NFT_TABLE="gateway"
+readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+readonly ORIGINAL_DOCKER_DAEMON="${ORIGINAL_DIR}/daemon.json"
+readonly NFT_CONFIRM_BACKUP="${STATE_DIR}/nftables.conf.pre-confirm"
+readonly NFT_CONFIRM_SECONDS=60
 
 # PPPoE
 readonly PPPOE_PEER_NAME="mihomo-gateway"
@@ -122,9 +128,15 @@ header(){
     echo
 }
 
+# Single y/N confirmation convention used everywhere in this script:
+# "[?] <question> [y/N]: ", default (bare Enter) is "no". The only other
+# interactive confirmation, nft_confirm_or_rollback()'s countdown, mirrors
+# this same wording/bracket/color style but reads a single keypress instead
+# of a line, because it must also enforce a timeout — that's a genuine
+# functional difference (rollback-on-timeout), not a style inconsistency.
 confirm(){
     local a
-    read -rp "$(echo -e "${YELLOW}${1:-Продолжить?} [y/N]: ${NC}")" a || return 1
+    read -rp "$(echo -e "${YELLOW}[?] ${1:-Продолжить?} [y/N]: ${NC}")" a || return 1
     [[ "$a" =~ ^([Yy]([Ee][Ss])?|[Дд]([Аа])?)$ ]]
 }
 press_enter(){ echo; read -rp "Нажмите Enter для продолжения..." _ || true; }
@@ -548,7 +560,7 @@ EOF2
     cat > "$DNSMASQ_OVERRIDE" <<'EOF2'
 [Unit]
 Wants=network-online.target
-After=network-online.target
+After=network-online.target nftables.service
 
 [Service]
 Restart=always
@@ -567,126 +579,342 @@ EOF2
 }
 
 # ─────────────────────────────── nftables ────────────────────────────
-# WAN-facing access control for the gateway's OWN services (input chain).
-# One "blocked from WAN" entry per line: <tcp|udp> <port> <label>
-# Everything NOT listed here stays reachable from WAN (input policy is
-# accept) — SSH included, matching today's real behavior. Blocking SSH (or
-# anything else) from WAN is just adding a row here through the menu, the
-# same way any other port is blocked; there is no separate SSH switch.
-wanaccess_seed_defaults(){
-    [[ -f "$WANACCESS_FILE" ]] && return 0
-    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-    # Seeds exactly the ports this gateway has always protected, so an
-    # upgrade from a version without this file changes nothing on disk.
-    cat > "$WANACCESS_FILE" <<'EOF2'
-tcp 80 Zashboard
-tcp 7890 Mihomo-proxy
-udp 7890 Mihomo-proxy
-tcp 9090 Mihomo-API
-tcp 53 DNS
-udp 53 DNS
+# Single authoritative firewall/NAT owner: one table ("inet gateway") holds
+# filtering (input/forward/output) AND NAT (postrouting/prerouting). Docker
+# never touches iptables/nftables (daemon.json: "iptables": false, see
+# configure_docker_daemon()), so this table is the only place that decides
+# what is reachable from LAN, from WAN, and what gets forwarded/NATed.
+#
+# Structural layer (chains, hooks, policies, set/map *definitions*) is
+# rendered by write_nft_structural() and changes rarely (install, LAN IP
+# change, NAT on/off). Data layer (which ports are open, which forwards
+# exist) lives in nftables sets/maps and is mutated with single
+# `nft add/delete element` calls (nft_add_port, nft_add_portfwd, ...) so a
+# menu edit is atomic and never reloads the whole ruleset. The on-disk
+# ${NFT_FILE} is kept in sync on every change (write_nft_structural is cheap
+# — it only writes a file) so a reboot or `systemctl restart nftables`
+# always reproduces the exact live state with no separate "restore" step.
+#
+# WAN is referenced everywhere as the dynamic set @wan_if (holds "wan" in
+# DHCP mode or "ppp0" in PPPoE mode) instead of being hardcoded into rule
+# text — switching WAN mode is a single `nft flush/add element` call
+# (see nft_set_wan_if), never a firewall reload.
+
+nft_lan_subnet(){ printf '%s.0/24' "$(subnet_of "$LAN_IP")"; }
+
+# elements= list for a simple port set, built from a "<tcp|udp> <port> <label>" file.
+nft_port_elements(){
+    local proto="$1" file="$2" ports=() p port _rest
+    [[ -f "$file" ]] || { printf ''; return 0; }
+    while read -r p port _rest; do
+        [[ "$p" == "$proto" ]] || continue
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        ports+=("$port")
+    done < "$file"
+    (( ${#ports[@]} > 0 )) && (IFS=,; printf '%s' "${ports[*]}")
+    return 0
+}
+
+# elements= list for the portfwd map, built from PORTFWD_FILE
+# ("<tcp|udp> <wan_port> <lan_ip> <lan_port>" lines).
+nft_portfwd_elements(){
+    local proto="$1" out=() p wport lip lport
+    [[ -f "$PORTFWD_FILE" ]] || { printf ''; return 0; }
+    while read -r p wport lip lport; do
+        [[ "$p" == "$proto" ]] || continue
+        [[ -n "$wport" && -n "$lip" && -n "$lport" ]] || continue
+        out+=("${wport} : ${lip} . ${lport}")
+    done < "$PORTFWD_FILE"
+    (( ${#out[@]} > 0 )) && (IFS=,; printf '%s' "${out[*]}")
+    return 0
+}
+
+# nft rejects an empty "elements = {  }" clause — this must be omitted
+# entirely (not just left blank) when there is no data yet.
+nft_elements_clause(){
+    [[ -n "$1" ]] && printf '        elements = { %s }\n' "$1"
+    return 0
+}
+
+# Renders the complete /etc/nftables.conf (structure + current data) from
+# the state files. Pure function of state — always safe to call, never
+# touches the live kernel ruleset by itself.
+write_nft_structural(){
+    local wan_if lan_net lan_tcp lan_udp wan_tcp wan_udp pf_tcp pf_udp nat_rule=""
+    wan_if="$(wan_out_iface)"
+    lan_net="$(nft_lan_subnet)"
+    lan_tcp="$(nft_port_elements tcp "$LAN_ALLOW_FILE")"
+    lan_udp="$(nft_port_elements udp "$LAN_ALLOW_FILE")"
+    wan_tcp="$(nft_port_elements tcp "$WAN_ALLOW_FILE")"
+    wan_udp="$(nft_port_elements udp "$WAN_ALLOW_FILE")"
+    pf_tcp="$(nft_portfwd_elements tcp)"
+    pf_udp="$(nft_portfwd_elements udp)"
+    [[ "$NAT_ENABLED" == "1" ]] && nat_rule="        ip saddr ${lan_net} oifname @wan_if masquerade"
+
+    cat > "$NFT_FILE" <<EOF2
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet ${NFT_TABLE} {
+    set wan_if {
+        type ifname
+        elements = { "${wan_if}" }
+    }
+
+    set lan_allow_tcp {
+        type inet_service
+$(nft_elements_clause "$lan_tcp")
+    }
+    set lan_allow_udp {
+        type inet_service
+$(nft_elements_clause "$lan_udp")
+    }
+    set wan_allow_tcp {
+        type inet_service
+$(nft_elements_clause "$wan_tcp")
+    }
+    set wan_allow_udp {
+        type inet_service
+$(nft_elements_clause "$wan_udp")
+    }
+
+    map portfwd_tcp {
+        type inet_service : ipv4_addr . inet_service
+$(nft_elements_clause "$pf_tcp")
+    }
+    map portfwd_udp {
+        type inet_service : ipv4_addr . inet_service
+$(nft_elements_clause "$pf_udp")
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state invalid drop
+        iif "lo" accept
+        ct state established,related accept
+        # Mihomo's own auto-redirect table (table inet mihomo) intercepts
+        # LAN traffic with a plain nftables "redirect to :<port>" rule — a
+        # DNAT-to-local operation. That reclassifies the packet as
+        # locally-destined, so it traverses this INPUT hook instead of
+        # FORWARD, hitting a destination port internal to mihomo (not
+        # fixed, not known to this firewall) that would otherwise fall
+        # through to the default-drop policy below. Confirmed on real
+        # hardware: mihomo's redirect/dnat rules never set any packet or
+        # connection mark, so matching on the mark this refactor originally
+        # tried (meta mark) never fires — ct status dnat is the one fact
+        # that's actually true of this traffic, and is the same signal the
+        # forward chain below already uses for WAN->LAN port-forwarding.
+        ct status dnat accept
+        iifname "lan" icmp type echo-request accept
+        iifname "lan" tcp dport @lan_allow_tcp accept
+        iifname "lan" udp dport @lan_allow_udp accept
+        iifname @wan_if tcp dport @wan_allow_tcp accept
+        iifname @wan_if udp dport @wan_allow_udp accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state invalid drop
+        ct state established,related accept
+        # MSS clamping MUST run before the terminal "accept" statements below:
+        # once a packet hits "iifname lan accept" its chain evaluation stops
+        # (accept is a terminal verdict), so a clamp rule placed after it
+        # would never execute for any LAN-forwarded packet. This ordering
+        # bug existed in the pre-refactor ruleset too (inherited, not new).
+        iifname @wan_if tcp flags syn tcp option maxseg size set rt mtu
+        oifname @wan_if tcp flags syn tcp option maxseg size set rt mtu
+        iifname "lan" accept
+        ct status dnat accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+${nat_rule}
+    }
+
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname @wan_if dnat ip to tcp dport map @portfwd_tcp
+        iifname @wan_if dnat ip to udp dport map @portfwd_udp
+    }
+}
 EOF2
-    chmod 600 "$WANACCESS_FILE"
+    chmod 644 "$NFT_FILE"
 }
 
-wanaccess_input_rules(){
-    wanaccess_seed_defaults
-    local proto port label
-    while read -r proto port label; do
-        [[ -z "$proto" ]] && continue
-        printf '    iifname { "wan", "%s" } %s dport %s drop\n' "$PPPOE_IFACE" "$proto" "$port"
-    done < "$WANACCESS_FILE"
+# ── atomic runtime element mutation (no reload, no rules-disappear window) ─
+nft_add_port(){ nft add element inet "$NFT_TABLE" "$1" "{ $2 }" 2>/dev/null; }
+nft_del_port(){ nft delete element inet "$NFT_TABLE" "$1" "{ $2 }" 2>/dev/null; }
+nft_add_portfwd(){ nft add element inet "$NFT_TABLE" "$1" "{ $2 : $3 . $4 }" 2>/dev/null; }
+nft_del_portfwd(){ nft delete element inet "$NFT_TABLE" "$1" "{ $2 : $3 . $4 }" 2>/dev/null; }
+
+# Called whenever WAN mode switches (DHCP<->PPPoE): one atomic set update,
+# never a firewall reload. Safe to call even if nftables isn't loaded yet
+# (fresh install) — write_nft_structural() will pick up the right value
+# regardless the next time the structural file is (re)rendered.
+nft_set_wan_if(){
+    local iface="$1"
+    nft flush set inet "$NFT_TABLE" wan_if 2>/dev/null || return 1
+    nft add element inet "$NFT_TABLE" wan_if "{ \"${iface}\" }" 2>/dev/null || return 1
+    return 0
 }
 
-wanaccess_count(){ [[ -s "$WANACCESS_FILE" ]] && grep -c . "$WANACCESS_FILE" || echo 0; }
+# ── inline, synchronous confirm-or-rollback (no separate menu/CLI step) ───
+# Snapshot the ACTUAL live ruleset (ground truth, not just a copy of a state
+# file that may already have been edited) before a risky change is made.
+# Call this BEFORE performing the change; nft_confirm_or_rollback() restores
+# this snapshot if the change isn't confirmed.
+nft_snapshot(){
+    rm -f "$NFT_CONFIRM_BACKUP"
+    if systemctl is-active --quiet nftables 2>/dev/null; then
+        nft -s list ruleset > "$NFT_CONFIRM_BACKUP" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Call AFTER a risky nftables change is already live. Blocks with a visible
+# countdown; 'y' confirms and keeps the change, 'n' or timeout restores the
+# ruleset captured by the most recent nft_snapshot(). This is the ONLY
+# confirm mechanism — automatic, inline, no separate menu item or CLI arg,
+# used identically during install and during normal menu-driven changes.
+# Restores the live kernel ruleset only; the caller is responsible for
+# reverting its own state file / in-memory variable and re-running
+# write_nft_structural() on a rollback (mirrors the existing pattern for
+# NAT on/off — see firewall_menu()).
+nft_confirm_or_rollback(){
+    echo
+    warn "Правила firewall изменены и требуют подтверждения."
+    warn "Проверьте SSH / Zashboard / Mihomo API с другого устройства, не закрывая эту сессию."
+    echo
+
+    local remaining=$NFT_CONFIRM_SECONDS key answer=""
+    while (( remaining > 0 )); do
+        printf '\r%s[?] Подтвердить изменения? [y/N]:%s (откат через %02d:%02d) ' \
+            "$YELLOW" "$NC" $(( remaining / 60 )) $(( remaining % 60 ))
+        if read -rsn1 -t 1 key 2>/dev/null; then
+            case "$key" in
+                y|Y) answer=y; break ;;
+                n|N) answer=n; break ;;
+                *) : ;;
+            esac
+        fi
+        remaining=$((remaining - 1))
+    done
+    printf '\r\033[2K'
+
+    if [[ "$answer" == y ]]; then
+        success "Изменения firewall подтверждены."
+        rm -f "$NFT_CONFIRM_BACKUP"
+        return 0
+    fi
+
+    [[ "$answer" == n ]] && warn "Изменения отклонены — откат к предыдущей конфигурации." \
+                         || warn "Время ожидания истекло — откат к предыдущей конфигурации."
+    if [[ -s "$NFT_CONFIRM_BACKUP" ]]; then
+        if { echo "flush ruleset"; cat "$NFT_CONFIRM_BACKUP"; } | nft -f -; then
+            success "Предыдущая конфигурация firewall восстановлена."
+        else
+            error "ОТКАТ НЕ УДАЛСЯ — проверьте вручную: nft list ruleset"
+        fi
+    else
+        nft flush ruleset 2>/dev/null || true
+        warn "До этого изменения firewall не был настроен — правила очищены."
+    fi
+    rm -f "$NFT_CONFIRM_BACKUP"
+    return 1
+}
+
+# Convenience wrapper for the common case: snapshot already taken by the
+# caller, $NFT_FILE already re-rendered by write_nft_structural() — this
+# just does the syntax check, the atomic load, and the confirm-or-rollback.
+# Returns 0 only if the admin actually confirmed the change.
+nft_apply_with_confirm(){
+    nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables — правила не применены."; rm -f "$NFT_CONFIRM_BACKUP"; return 1; }
+    if ! nft -f "$NFT_FILE"; then
+        error "Не удалось загрузить новые правила nftables."
+        rm -f "$NFT_CONFIRM_BACKUP"
+        return 1
+    fi
+    systemctl enable nftables >/dev/null 2>&1 || true
+    nft_confirm_or_rollback
+}
+
+# ── WAN allow-list (default-deny, explicit allow) ──────────────────────
+wanaccess_seed_defaults(){
+    [[ -f "$WAN_ALLOW_FILE" ]] && return 0
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    cat > "$WAN_ALLOW_FILE" <<'EOF2'
+tcp 22 SSH
+tcp 80 Zashboard
+tcp 9090 Mihomo-API
+EOF2
+    chmod 600 "$WAN_ALLOW_FILE"
+}
+
+wanaccess_count(){ wanaccess_seed_defaults; [[ -s "$WAN_ALLOW_FILE" ]] && grep -c . "$WAN_ALLOW_FILE" || echo 0; }
 
 wanaccess_print_table(){
     wanaccess_seed_defaults
-    if [[ ! -s "$WANACCESS_FILE" ]]; then
-        echo "  Заблокированных портов нет — все сервисы gateway доступны с WAN."
+    if [[ ! -s "$WAN_ALLOW_FILE" ]]; then
+        echo "  Разрешённых портов нет — gateway полностью недоступен с WAN."
         return 0
     fi
     local i=0 proto port label
     while read -r proto port label; do
         [[ -z "$proto" ]] && continue
         i=$((i+1))
-        printf '  %s) %-4s порт %-6s заблокирован — %s\n' "$i" "${proto^^}" "$port" "${label:-без описания}"
-    done < "$WANACCESS_FILE"
+        printf '  %s) %-4s порт %-6s разрешён — %s\n' "$i" "${proto^^}" "$port" "${label:-без описания}"
+    done < "$WAN_ALLOW_FILE"
 }
 
-# Port-forward (DNAT) rules live in PORTFWD_FILE, one per line:
-#   <tcp|udp> <wan_port> <lan_ip> <lan_port>
-portfwd_dnat_rules(){
-    [[ -s "$PORTFWD_FILE" ]] || return 0
-    local proto wport lip lport
-    while read -r proto wport lip lport; do
-        [[ -z "$proto" ]] && continue
-        printf '    iifname { "wan", "%s" } %s dport %s dnat to %s:%s\n' \
-            "$PPPOE_IFACE" "$proto" "$wport" "$lip" "$lport"
-    done < "$PORTFWD_FILE"
-}
-
-write_nftables(){
-    local out; out="$(wan_out_iface)"     # wan in DHCP mode, ppp0 in PPPoE mode
-    local dnat_rules; dnat_rules="$(portfwd_dnat_rules)"
-
-    local nat_block=""
-    if [[ "$NAT_ENABLED" == "1" || -n "$dnat_rules" ]]; then
-        nat_block=$(cat <<EOF2
-
-table ip gateway_nat {
-$( [[ "$NAT_ENABLED" == "1" ]] && cat <<EOF3
-  chain postrouting {
-    type nat hook postrouting priority srcnat; policy accept;
-    oifname "${out}" ip saddr $(subnet_of "$LAN_IP").0/24 masquerade
-  }
-EOF3
-)
-$( [[ -n "$dnat_rules" ]] && printf '  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n%s\n  }\n' "$dnat_rules" )
-}
-EOF2
-        )
+# ── LAN allow-list (default-deny, explicit allow — same model as WAN) ───
+lan_allow_seed_defaults(){
+    if [[ -f "$LAN_ALLOW_FILE" ]]; then
+        # Self-heal: udp/67 (DHCP server) was missing from the very first
+        # cut of this default-deny LAN policy — without it, the gateway's
+        # own firewall blocks LAN clients' DHCP requests before dnsmasq
+        # ever sees them. Backfill it into any file that predates this fix.
+        grep -qE '^udp 67 ' "$LAN_ALLOW_FILE" 2>/dev/null || {
+            printf 'udp 67 DHCP\n' >> "$LAN_ALLOW_FILE"
+            chmod 600 "$LAN_ALLOW_FILE"
+        }
+        return 0
     fi
-
-    cat > "$NFT_FILE" <<EOF2
-#!/usr/sbin/nft -f
-
-table inet gateway_filter {
-  chain input {
-    type filter hook input priority filter; policy accept;
-$(wanaccess_input_rules)
-  }
-
-  chain forward {
-    type filter hook forward priority filter; policy drop;
-    ct state invalid drop
-    ct state established,related accept
-    iifname "lan" accept
-    ct status dnat accept
-    oifname { "wan", "${PPPOE_IFACE}" } tcp flags syn tcp option maxseg size set rt mtu
-    iifname { "wan", "${PPPOE_IFACE}" } tcp flags syn tcp option maxseg size set rt mtu
-  }
-}
-${nat_block}
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    cat > "$LAN_ALLOW_FILE" <<'EOF2'
+tcp 22 SSH
+tcp 80 Zashboard
+tcp 7890 Mihomo-proxy
+udp 7890 Mihomo-proxy
+tcp 9090 Mihomo-API
+tcp 53 DNS
+udp 53 DNS
+udp 67 DHCP
 EOF2
-    chmod 644 "$NFT_FILE"
+    chmod 600 "$LAN_ALLOW_FILE"
 }
 
-reload_nftables(){
-    nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables."; return 1; }
-    # Old tables must go first: nft -f only ever *adds* rules to an existing
-    # table/chain, so re-applying without a delete would duplicate every
-    # input/forward/NAT rule on each toggle (NAT, port-forward add/remove...).
-    nft delete table inet gateway_filter 2>/dev/null || true
-    nft delete table ip gateway_nat 2>/dev/null || true
-    nft -f "$NFT_FILE" || return 1
-    # Loading rules this way bypasses systemd entirely, so if the firewall
-    # was previously turned off via the menu, applying any change here also
-    # implies "keep enforcing this on reboot" — re-enable the unit to match.
-    systemctl enable nftables >/dev/null 2>&1 || true
-    return 0
+lan_allow_count(){ lan_allow_seed_defaults; [[ -s "$LAN_ALLOW_FILE" ]] && grep -c . "$LAN_ALLOW_FILE" || echo 0; }
+
+lan_allow_print_table(){
+    lan_allow_seed_defaults
+    if [[ ! -s "$LAN_ALLOW_FILE" ]]; then
+        echo "  Разрешённых портов нет — gateway полностью недоступен из LAN."
+        return 0
+    fi
+    local i=0 proto port label
+    while read -r proto port label; do
+        [[ -z "$proto" ]] && continue
+        i=$((i+1))
+        printf '  %s) %-4s порт %-6s разрешён — %s\n' "$i" "${proto^^}" "$port" "${label:-без описания}"
+    done < "$LAN_ALLOW_FILE"
 }
 
+# ── port forwarding (WAN → LAN device, DNAT via nft map) ────────────────
 portfwd_count(){ [[ -s "$PORTFWD_FILE" ]] && grep -c . "$PORTFWD_FILE" || echo 0; }
 
 portfwd_print_table(){
@@ -704,32 +932,41 @@ portfwd_print_table(){
 }
 
 configure_nftables(){
-    header "УСТАНОВКА · NFTABLES / NAT"
+    header "УСТАНОВКА · NFTABLES / NAT / FIREWALL"
     apt_install nftables
     [[ -f "$NFT_FILE" && ! -f "$ORIGINAL_NFT" ]] && cp -a "$NFT_FILE" "$ORIGINAL_NFT"
-    write_nftables
+    wanaccess_seed_defaults
+    lan_allow_seed_defaults
+    nft_snapshot
+    write_nft_structural
     nft -c -f "$NFT_FILE" || { error "Ошибка синтаксиса nftables."; return 1; }
-    success "Конфигурация nftables — OK"
-    systemctl enable nftables >/dev/null 2>&1 || true
-    run_timed "Применение nftables" systemctl restart nftables
+    success "Конфигурация nftables — OK (LAN allow-list: $(lan_allow_count) портов, WAN allow-list: $(wanaccess_count) портов)"
+    # Not run through run_timed(): the confirm countdown must be interactive
+    # on the terminal directly — run_timed captures stdout into a log file.
+    nft_apply_with_confirm
 }
 
 configure_forwarding(){
-    header "УСТАНОВКА · IPV4 FORWARDING"
+    header "УСТАНОВКА · IPV4 FORWARDING / IPV6"
     [[ -f "$SYSCTL_FILE" && ! -f "$ORIGINAL_SYSCTL" ]] && cp -a "$SYSCTL_FILE" "$ORIGINAL_SYSCTL"
+    # IPv6 is deliberately and explicitly disabled: this gateway is IPv4-only
+    # by design, not "IPv6 accidentally left half-configured".
+    # ip_nonlocal_bind is intentionally NOT set here: Zashboard and Mihomo
+    # both run in network_mode: host and bind 0.0.0.0, so no service needs to
+    # bind an address that might not exist yet — access is controlled purely
+    # by nftables, not by which address a container can bind.
     cat > "$SYSCTL_FILE" <<'EOF2'
 net.ipv4.ip_forward=1
-# Lets services bind the LAN address before the LAN link is up
-# (zashboard publishes on ${LAN_IP}:80).
-net.ipv4.ip_nonlocal_bind=1
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
 EOF2
     sysctl --system >/dev/null
     [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]] || { error "Не удалось включить forwarding."; return 1; }
     success "IPv4 forwarding → active"
-    if [[ "$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || echo 0)" == 1 ]]; then
-        success "Привязка к LAN-адресу без линка → разрешена"
+    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" == 1 ]]; then
+        success "IPv6 → отключён"
     else
-        warn "Не удалось включить ip_nonlocal_bind — панель поднимется только с линком на LAN."
+        warn "Не удалось отключить IPv6 через sysctl."
     fi
 }
 
@@ -788,6 +1025,65 @@ install_docker(){
     docker info >/dev/null 2>&1              || { error "docker info не отвечает."; return 1; }
     success "Docker Engine → active"
     success "Docker Compose → OK"
+    configure_docker_daemon || return 1
+}
+
+# Docker never manages iptables/nftables: nftables (write_nft_structural) is
+# the single owner of ALL filtering/NAT. This matters because Mihomo and
+# Zashboard both run in network_mode: host — there is no Docker bridge
+# network left for Docker's own DOCKER/DOCKER-ISOLATION chains to apply to,
+# and disabling them at the daemon level makes that a guarantee rather than
+# an accident of today's container config. live-restore keeps already-
+# running containers alive across a daemon restart — required here because
+# THIS restart is the one that turns iptables management off; without it,
+# an already-running Mihomo container would be stopped and restarted by the
+# daemon restart itself (a one-time, few-second blip on upgrade — harmless
+# on a fresh install where no containers exist yet).
+configure_docker_daemon(){
+    header "УСТАНОВКА · DOCKER · СЕТЕВАЯ МОДЕЛЬ"
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+    if [[ -f "$DOCKER_DAEMON_JSON" && ! -f "$ORIGINAL_DOCKER_DAEMON" ]]; then
+        mkdir -p "$ORIGINAL_DIR"; chmod 700 "$ORIGINAL_DIR"
+        cp -a "$DOCKER_DAEMON_JSON" "$ORIGINAL_DOCKER_DAEMON"
+    fi
+    cat > "$DOCKER_DAEMON_JSON" <<'EOF2'
+{
+    "iptables": false,
+    "ip6tables": false,
+    "live-restore": true
+}
+EOF2
+    chmod 644 "$DOCKER_DAEMON_JSON"
+
+    if systemctl is-active --quiet docker 2>/dev/null; then
+        warn "Docker daemon перезапускается для применения новой сетевой модели."
+        warn "Если контейнеры уже были запущены без live-restore — они перезапустятся один раз (несколько секунд)."
+        run_timed "Перезапуск Docker daemon" systemctl restart docker || {
+            error "Не удалось перезапустить Docker daemon с новой конфигурацией."
+            return 1
+        }
+    else
+        systemctl daemon-reload
+    fi
+    systemctl is-active --quiet docker 2>/dev/null \
+        && success "Docker daemon: iptables отключён, live-restore включён." \
+        || { error "Docker daemon не запустился после изменения конфигурации."; return 1; }
+
+    # One-time cleanup: "iptables": false stops Docker from managing these
+    # going forward, but restarting the daemon does NOT retroactively tear
+    # down chains a PREVIOUS (iptables: true) daemon run already created —
+    # they're left behind as orphaned, inert-but-still-registered netfilter
+    # hooks. Safe to remove: identified specifically by their DOCKER/
+    # DOCKER-* chain names, and nftables (table inet gateway) is now this
+    # box's sole firewall/NAT owner.
+    local fam name pair
+    for pair in "ip nat" "ip filter" "ip6 nat" "ip6 filter"; do
+        read -r fam name <<<"$pair"
+        if nft list table "$fam" "$name" 2>/dev/null | grep -q 'chain DOCKER '; then
+            nft delete table "$fam" "$name" 2>/dev/null \
+                && info "Удалена устаревшая таблица Docker: ${fam} ${name}"
+        fi
+    done
 }
 
 compose(){ ( cd "$PROJECT_DIR" && docker compose "$@" ); }
@@ -956,8 +1252,7 @@ services:
     image: ${ZASHBOARD_IMAGE}
     container_name: zashboard
     restart: unless-stopped
-    ports:
-      - "${LAN_IP}:80:80"
+    network_mode: host
     environment:
       TZ: ${TZ}
     logging:
@@ -996,7 +1291,6 @@ mask_secret(){
 
 iface_ipv4(){ ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
 default_gw_via(){ ip -4 route show default 2>/dev/null | awk -v d="$1" '$0 ~ ("dev "d)  {print $3; exit}'; }
-default_dev(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
 
 internet_ok(){
     ping -c1 -W2 -n 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -1013,7 +1307,6 @@ pppoe_link_ok(){
     ip -4 route show default 2>/dev/null | grep -q "dev ${PPPOE_IFACE}" || return 1
     return 0
 }
-pppoe_session_ok(){ pppoe_link_ok && internet_ok; }
 
 wan_link_ok(){
     [[ -n "$(iface_ipv4 wan)" ]] || return 1
@@ -1301,6 +1594,10 @@ switch_wan_mode(){
         # The DHCP lease must not linger on wan while pppd owns the link.
         ip -4 addr flush dev wan 2>/dev/null || true
     fi
+    # Atomic set update — never a firewall reload. Safe even if nftables
+    # isn't loaded yet: write_nft_structural() re-derives wan_if from
+    # wan_out_iface() independently the next time it runs.
+    nft_set_wan_if "$(wan_out_iface)" 2>/dev/null || true
     return 0
 }
 
@@ -1360,7 +1657,7 @@ pppoe_rollback_to_dhcp(){
         return 1
     fi
     write_config
-    write_nftables && reload_nftables || warn "Не удалось обновить правила NAT."
+    write_nft_structural || warn "Не удалось обновить файл nftables."
 
     if wait_for_dhcp_wan; then
         success "WAN снова работает по DHCP: $(iface_ipv4 wan)"
@@ -1440,7 +1737,7 @@ pppoe_enable(){
         return 1
     fi
     success "WAN переведён в режим PPPoE (LAN не затронут)."
-    write_nftables && reload_nftables || warn "Не удалось обновить NAT для ppp0."
+    write_nft_structural || warn "Не удалось обновить файл nftables."
 
     header "PPPoE · ШАГ 6/6 · ПОДКЛЮЧЕНИЕ"
     if pppoe_try_connect "${PPPOE_ATTEMPTS:-10}"; then
@@ -1448,7 +1745,7 @@ pppoe_enable(){
         WAN_MODE="pppoe"
         write_config
         save_wan_rollback pppoe
-        write_nftables && reload_nftables || warn "Не удалось обновить NAT."
+        write_nft_structural || warn "Не удалось обновить файл nftables."
         pppoe_sync_watchdog
         echo
         success "PPPoE успешно инициализирован."
@@ -1483,7 +1780,7 @@ pppoe_disable(){
         return 1
     fi
     write_config
-    write_nftables && reload_nftables || warn "Не удалось обновить NAT."
+    write_nft_structural || warn "Не удалось обновить файл nftables."
 
     if wait_for_dhcp_wan; then
         success "WAN работает по DHCP: $(iface_ipv4 wan)"
@@ -1695,10 +1992,6 @@ network_is_ready(){
     [[ -f "$CONFIG_FILE" ]]  || return 1
     [[ -f "$NETPLAN_FILE" ]] || return 1
     [[ -n "$LAN_MAC" && -n "$WAN_MAC" ]] || return 1
-    if [[ ! -f "$NETWORK_MARKER" ]]; then
-        # Migration for setups made by earlier versions of this script.
-        echo "NETWORK_CONFIGURED=1" > "$NETWORK_MARKER"
-    fi
     return 0
 }
 
@@ -1722,10 +2015,15 @@ quick_status(){
     local docker_ok=0
     if ! network_is_ready; then
         status_row "Сеть" fail
-    elif network_link_ok; then
-        status_row "Сеть" ok
-    else
+    elif ! network_link_ok; then
         status_row "Сеть" off "LAN-адрес ${LAN_IP} не поднят"
+    # ignore-carrier keeps the address configured even with the cable
+    # unplugged, so the address check above can't detect that case —
+    # check carrier explicitly so "no cable" doesn't look identical to "ok".
+    elif ip -br link show lan 2>/dev/null | grep -q 'NO-CARRIER'; then
+        status_row "Сеть" off "LAN кабель не подключён"
+    else
+        status_row "Сеть" ok
     fi
     systemctl is-active --quiet dnsmasq 2>/dev/null && status_row "DHCP" ok || status_row "DHCP" fail
 
@@ -1740,8 +2038,8 @@ quick_status(){
         [[ -n "$wip" ]] && status_row "WAN" ok "DHCP · ${wip}" || status_row "WAN" off "DHCP · нет адреса"
     fi
 
-    if nft list table ip gateway_nat >/dev/null 2>&1; then
-        status_row "NAT" ok "$(subnet_of "$LAN_IP").0/24 → wan"
+    if [[ "$NAT_ENABLED" == "1" ]] && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        status_row "NAT" ok "$(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
     else
         status_row "NAT" off
     fi
@@ -1776,12 +2074,31 @@ full_diagnostics(){
     header "ПОЛНАЯ ДИАГНОСТИКА / СТАТУСЫ"
     load_config || true
     echo -e "${BOLD}СЕТЬ${NC}"
-    echo "  LAN интерфейс: ${LAN_IFACE:-неизвестно}"
+    # LAN_IFACE/WAN_IFACE below are the ORIGINAL physical NIC names chosen
+    # during setup (used only for MAC-address matching in netplan) — they
+    # are NOT re-queried live and will keep showing e.g. "enp3s0" forever,
+    # even after netplan successfully renames the actual device to "lan"/
+    # "wan". That renamed state is what "ip -br link show lan" below
+    # reports — that line, not this one, is the one to trust for "did the
+    # rename actually work".
+    echo "  LAN исходный интерфейс (MAC-match): ${LAN_IFACE:-неизвестно}"
     echo "  LAN адрес:     ${LAN_IP}/24"
-    echo "  WAN интерфейс: ${WAN_IFACE:-неизвестно} (режим: ${WAN_MODE:-dhcp})"
+    echo "  WAN исходный интерфейс (MAC-match): ${WAN_IFACE:-неизвестно} (режим: ${WAN_MODE:-dhcp})"
     echo "  DHCP:          ${DHCP_START}–${DHCP_END}"
     echo "  DNS upstream:  ${DNS1}, ${DNS2}"
     echo
+    if ip link show lan >/dev/null 2>&1; then
+        if ip -4 -o addr show lan 2>/dev/null | grep -q .; then
+            success "Переименование lan → выполнено успешно"
+        else
+            warn "Интерфейс lan существует, но без IPv4-адреса"
+        fi
+        if ip -br link show lan 2>/dev/null | grep -q 'NO-CARRIER'; then
+            warn "LAN: кабель НЕ подключён (NO-CARRIER) — устройства LAN не получат связь, пока кабель не воткнут"
+        fi
+    else
+        error "Интерфейс lan не найден — переименование НЕ выполнено"
+    fi
     ip -br addr show lan 2>/dev/null || true
     ip -br addr show wan 2>/dev/null || true
     [[ "${WAN_MODE:-dhcp}" == pppoe ]] && { ip -br addr show "$PPPOE_IFACE" 2>/dev/null || true; }
@@ -1820,18 +2137,31 @@ full_diagnostics(){
     echo "  URL:        http://${LAN_IP}/"
     check_ui && echo -e "  Проверка:   ${GREEN}OK${NC}" || echo -e "  Проверка:   ${RED}FAIL${NC}"
     echo
-    echo -e "${BOLD}NAT${NC}"
+    echo -e "${BOLD}FIREWALL / NAT (таблица inet ${NFT_TABLE})${NC}"
     if [[ "$NAT_ENABLED" == 1 ]]; then
-        echo -e "  Состояние:  ${GREEN}включён${NC}"
+        echo -e "  NAT:                    ${GREEN}включён${NC}  $(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
     else
-        echo -e "  Состояние:  ${YELLOW}выключен${NC}"
+        echo -e "  NAT:                    ${YELLOW}выключен${NC}"
     fi
-    echo "  LAN → WAN:  $(subnet_of "$LAN_IP").0/24 → $(wan_out_iface)"
-    echo "  Проброс портов (DNAT): $(portfwd_count) правил(о) — подробнее: Настройки → Сеть → Firewall → Статус"
+    echo "  Доступ к gateway с LAN: $(lan_allow_count) портов разрешено (default-deny)"
+    echo "  Доступ к gateway с WAN: $(wanaccess_count) портов разрешено (default-deny)"
+    echo "  Проброс портов (DNAT): $(portfwd_count) правил(о)"
+    echo
+    echo -e "${BOLD}IPv6${NC}"
+    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" == 1 ]]; then
+        echo -e "  Состояние:  ${GREEN}отключён${NC}"
+    else
+        echo -e "  Состояние:  ${RED}включён${NC} (ожидалось: отключён)"
+    fi
+    echo
+    echo -e "${BOLD}DOCKER — СЕТЕВАЯ МОДЕЛЬ${NC}"
+    if [[ -f "$DOCKER_DAEMON_JSON" ]] && grep -q '"iptables": false' "$DOCKER_DAEMON_JSON" 2>/dev/null; then
+        echo -e "  iptables:   ${GREEN}отключён${NC}"
+    else
+        echo -e "  iptables:   ${YELLOW}не подтверждено — см. ${DOCKER_DAEMON_JSON}${NC}"
+    fi
 }
 
-# Identifies the single active filtering mechanism and dumps the live
-# ruleset, so "what actually blocks/allows this port" has one answer.
 # ─────────────────────────────── установка ───────────────────────────
 stack_present(){ [[ -f "$COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; }
 
@@ -1846,8 +2176,9 @@ apply_generated(){
     write_config
     write_netplan            || return 1
     netplan generate         || { error "Ошибка Netplan."; return 1; }
-    write_nftables
-    reload_nftables          || return 1
+    nft_snapshot
+    write_nft_structural
+    nft_apply_with_confirm   || return 1
     run_timed "Применение Netplan" apply_netplan_checked || return 1
     configure_dnsmasq        || return 1
     if stack_present; then
@@ -1880,8 +2211,9 @@ install_stack(){
     validate_config || return 1
 
     header "ЗАПУСК КОНТЕЙНЕРОВ"
-    # Zashboard may fail to bind ${LAN_IP}:80 while the LAN link is down,
-    # so a non-zero exit here is not fatal — Mihomo is checked separately below.
+    # Both containers run in network_mode: host and bind 0.0.0.0, so neither
+    # depends on the LAN link being up or an address existing yet — startup
+    # here no longer has a legitimate "expected to fail" case.
     run_timed "Запуск Mihomo + Zashboard" \
         bash -c "cd '$PROJECT_DIR' && docker compose up -d --remove-orphans" \
         || warn "Не все контейнеры стартовали с первого раза."
@@ -1897,17 +2229,10 @@ install_stack(){
     }
     success "Mihomo → running"
 
-    if ! check_container "$ZASHBOARD_CONTAINER"; then
-        docker start "$ZASHBOARD_CONTAINER" >/dev/null 2>&1 || true
-        sleep 2
-    fi
-    if check_container "$ZASHBOARD_CONTAINER"; then
-        success "Zashboard → running"
-    else
-        warn "Zashboard пока не запущен (обычно — нет линка на LAN)."
-        docker logs --tail 20 "$ZASHBOARD_CONTAINER" >&2 || true
-        warn "Панель поднимется сама после подключения кабеля (restart: unless-stopped)."
-    fi
+    check_container "$ZASHBOARD_CONTAINER" || {
+        error "Zashboard не запущен."; docker logs --tail 60 "$ZASHBOARD_CONTAINER" >&2 || true; return 1
+    }
+    success "Zashboard → running"
 
     check_api && success "Mihomo API → доступен" || warn "Mihomo API пока не отвечает."
     check_ui  && success "Панель → доступна"     || warn "Панель пока не отвечает."
@@ -1994,8 +2319,8 @@ full_remove(){
     echo
     echo "Будут удалены/сброшены:"
     echo "  • Mihomo / Zashboard"
-    echo "  • Docker Engine и связанные пакеты"
-    echo "  • nftables, IPv4 forwarding"
+    echo "  • Docker Engine, /etc/docker/daemon.json и связанные пакеты"
+    echo "  • nftables, allow-listы LAN/WAN, проброс портов, IPv4 forwarding"
     echo "  • PPPoE: служба, watchdog, peer, учётные данные, состояние"
     echo "  • dnsmasq / DHCP"
     echo "  • 01-gateway.yaml"
@@ -2032,6 +2357,14 @@ full_remove(){
     rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources /etc/apt/keyrings/docker.asc
     rm -rf /var/lib/docker /var/lib/containerd
 
+    # Docker daemon.json: restore whatever pre-existed (or remove it if the
+    # gateway created it from nothing).
+    if [[ -f "$ORIGINAL_DOCKER_DAEMON" ]]; then
+        cp -a "$ORIGINAL_DOCKER_DAEMON" "$DOCKER_DAEMON_JSON"
+    else
+        rm -f "$DOCKER_DAEMON_JSON"
+    fi
+
     systemctl stop dnsmasq 2>/dev/null || true
     systemctl disable dnsmasq 2>/dev/null || true
     pkg_installed dnsmasq && { run_timed "Удаление dnsmasq" \
@@ -2039,9 +2372,10 @@ full_remove(){
     rm -rf /etc/systemd/system/dnsmasq.service.d
     systemctl daemon-reload
 
+    rm -f "$NFT_CONFIRM_BACKUP"
+
     if command -v nft >/dev/null 2>&1; then
-        nft delete table inet gateway_filter 2>/dev/null || true
-        nft delete table ip gateway_nat 2>/dev/null || true
+        nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     fi
     pkg_installed nftables && { run_timed "Удаление nftables" \
         env DEBIAN_FRONTEND=noninteractive apt-get purge -y nftables || true; }
@@ -2231,16 +2565,13 @@ portfwd_add_interactive(){
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
     for p in "${protos[@]}"; do
         printf '%s %s %s %s\n' "$p" "$wport" "$lip" "$lport" >> "$PORTFWD_FILE"
+        nft_add_portfwd "portfwd_${p}" "$wport" "$lip" "$lport"
     done
     chmod 600 "$PORTFWD_FILE"
+    write_nft_structural
 
-    write_nftables
-    if reload_nftables; then
-        local wan_ip; wan_ip="$(iface_ipv4 "$(wan_out_iface)")"; wan_ip="${wan_ip:-<WAN-IP>}"
-        success "Правило добавлено: ${wan_ip}:${wport} → ${lip}:${lport} (${proto})"
-    else
-        error "Не удалось применить nftables — правило сохранено, но не активно."
-    fi
+    local wan_ip; wan_ip="$(iface_ipv4 "$(wan_out_iface)")"; wan_ip="${wan_ip:-<WAN-IP>}"
+    success "Правило добавлено: ${wan_ip}:${wport} → ${lip}:${lport} (${proto})"
 }
 
 portfwd_remove_interactive(){
@@ -2254,28 +2585,28 @@ portfwd_remove_interactive(){
     local total; total=$(portfwd_count)
     (( n >= 1 && n <= total )) || { error "Нет правила №${n}."; return 0; }
 
+    local entry; entry=$(sed -n "${n}p" "$PORTFWD_FILE")
+    local proto wport lip lport; read -r proto wport lip lport <<<"$entry"
+
     local tmp; tmp=$(mktemp "${STATE_DIR}/.portfwd.XXXXXX")
     sed "${n}d" "$PORTFWD_FILE" > "$tmp" && mv "$tmp" "$PORTFWD_FILE"
     chmod 600 "$PORTFWD_FILE"
 
-    write_nftables
-    if reload_nftables; then
-        success "Правило №${n} удалено."
-    else
-        error "Не удалось применить nftables после удаления."
-    fi
+    nft_del_portfwd "portfwd_${proto}" "$wport" "$lip" "$lport"
+    write_nft_structural
+    success "Правило №${n} удалено."
 }
 
 wanaccess_menu(){
     while true; do
         header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN"
-        echo "Порты самого gateway, закрытые от прямого доступа из интернета."
-        echo "Всё, чего нет в списке (включая SSH), остаётся доступным с WAN."
+        echo "Порты gateway, явно разрешённые для доступа из интернета."
+        echo "Всё, чего нет в списке (включая SSH), недоступно с WAN — default-deny."
         echo
         wanaccess_print_table
         echo
-        menu_item 1 "Заблокировать порт"   "закрыть порт gateway от доступа с WAN"
-        menu_item 2 "Разблокировать порт"  "снова открыть порт для доступа с WAN"
+        menu_item 1 "Разрешить порт"    "открыть порт gateway для доступа с WAN"
+        menu_item 2 "Запретить порт"    "убрать порт из списка разрешённых для WAN"
         menu_item 0 "Назад" ""
         echo
         local c; read -rp "Выбор [0-2]: " c || return 0
@@ -2290,7 +2621,7 @@ wanaccess_menu(){
 }
 
 wanaccess_add_interactive(){
-    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · ЗАБЛОКИРОВАТЬ ПОРТ"
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · РАЗРЕШИТЬ ПОРТ"
     wanaccess_seed_defaults
     local proto port label
     read -rp "Протокол [tcp/udp] (tcp): " proto || return 0
@@ -2300,49 +2631,141 @@ wanaccess_add_interactive(){
     read -rp "Порт: " port || return 0
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { error "Порт должен быть 1-65535."; return 0; }
 
-    if grep -qE "^${proto} ${port} " "$WANACCESS_FILE" 2>/dev/null; then
-        warn "Порт ${port}/${proto} уже заблокирован для WAN."
+    if grep -qE "^${proto} ${port} " "$WAN_ALLOW_FILE" 2>/dev/null; then
+        warn "Порт ${port}/${proto} уже разрешён для WAN."
         return 0
     fi
 
     read -rp "Название (для памяти, необязательно): " label || return 0
     label="${label:-без описания}"
 
-    printf '%s %s %s\n' "$proto" "$port" "$label" >> "$WANACCESS_FILE"
-    chmod 600 "$WANACCESS_FILE"
+    printf '%s %s %s\n' "$proto" "$port" "$label" >> "$WAN_ALLOW_FILE"
+    chmod 600 "$WAN_ALLOW_FILE"
 
-    write_nftables
-    if reload_nftables; then
-        success "Порт ${port}/${proto} заблокирован для WAN."
-    else
-        error "Не удалось применить nftables — правило сохранено, но не активно."
-    fi
+    nft_add_port "wan_allow_${proto}" "$port"
+    write_nft_structural
+    success "Порт ${port}/${proto} разрешён для WAN."
 }
 
 wanaccess_remove_interactive(){
-    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · РАЗБЛОКИРОВАТЬ ПОРТ"
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С WAN · ЗАПРЕТИТЬ ПОРТ"
     wanaccess_print_table
-    [[ -s "$WANACCESS_FILE" ]] || return 0
+    [[ -s "$WAN_ALLOW_FILE" ]] || return 0
     echo
-    local n; read -rp "Номер правила для разблокировки (0 — отмена): " n || return 0
+    local n; read -rp "Номер правила для удаления (0 — отмена): " n || return 0
     [[ "$n" =~ ^[0-9]+$ ]] || { error "Введите число."; return 0; }
     (( n == 0 )) && return 0
     local total; total=$(wanaccess_count)
     (( n >= 1 && n <= total )) || { error "Нет правила №${n}."; return 0; }
 
-    local entry; entry=$(sed -n "${n}p" "$WANACCESS_FILE")
-    warn "Порт будет ОТКРЫТ для доступа из интернета: ${entry}"
-    confirm "Точно разблокировать этот порт для WAN?" || return 0
+    local entry proto port; entry=$(sed -n "${n}p" "$WAN_ALLOW_FILE"); read -r proto port _ <<<"$entry"
+    warn "Порт будет ЗАКРЫТ для доступа из интернета: ${entry}"
+    confirm "Точно запретить этот порт для WAN?" || return 0
 
+    # Removing WAN access can lock out remote admin (e.g. SSH) — protected
+    # by the same inline confirm-or-rollback as structural firewall changes.
+    nft_snapshot
     local tmp; tmp=$(mktemp "${STATE_DIR}/.wanaccess.XXXXXX")
-    sed "${n}d" "$WANACCESS_FILE" > "$tmp" && mv "$tmp" "$WANACCESS_FILE"
-    chmod 600 "$WANACCESS_FILE"
+    sed "${n}d" "$WAN_ALLOW_FILE" > "$tmp" && mv "$tmp" "$WAN_ALLOW_FILE"
+    chmod 600 "$WAN_ALLOW_FILE"
 
-    write_nftables
-    if reload_nftables; then
-        success "Порт разблокирован для WAN."
+    nft_del_port "wan_allow_${proto}" "$port"
+    write_nft_structural
+
+    if nft_confirm_or_rollback; then
+        success "Порт запрещён для WAN."
     else
-        error "Не удалось применить nftables после изменения."
+        # nft_confirm_or_rollback already restored the live ruleset — put
+        # the state file (and the on-disk copy) back in sync with it.
+        printf '%s\n' "$entry" >> "$WAN_ALLOW_FILE"
+        chmod 600 "$WAN_ALLOW_FILE"
+        write_nft_structural
+        error "Изменение отменено — порт остаётся разрешён для WAN."
+    fi
+}
+
+lan_allow_menu(){
+    while true; do
+        header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С LAN"
+        echo "Порты gateway, явно разрешённые для доступа из локальной сети."
+        echo "Всё, чего нет в списке, недоступно из LAN — default-deny."
+        echo
+        lan_allow_print_table
+        echo
+        menu_item 1 "Разрешить порт" "открыть порт gateway для доступа из LAN"
+        menu_item 2 "Запретить порт" "убрать порт из списка разрешённых для LAN"
+        menu_item 0 "Назад" ""
+        echo
+        local c; read -rp "Выбор [0-2]: " c || return 0
+        case "$c" in
+            1) lan_allow_add_interactive ;;
+            2) lan_allow_remove_interactive ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        press_enter
+    done
+}
+
+lan_allow_add_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С LAN · РАЗРЕШИТЬ ПОРТ"
+    lan_allow_seed_defaults
+    local proto port label
+    read -rp "Протокол [tcp/udp] (tcp): " proto || return 0
+    proto="${proto:-tcp}"; proto="${proto,,}"
+    [[ "$proto" == tcp || "$proto" == udp ]] || { error "Протокол: tcp или udp."; return 0; }
+
+    read -rp "Порт: " port || return 0
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { error "Порт должен быть 1-65535."; return 0; }
+
+    if grep -qE "^${proto} ${port} " "$LAN_ALLOW_FILE" 2>/dev/null; then
+        warn "Порт ${port}/${proto} уже разрешён для LAN."
+        return 0
+    fi
+
+    read -rp "Название (для памяти, необязательно): " label || return 0
+    label="${label:-без описания}"
+
+    printf '%s %s %s\n' "$proto" "$port" "$label" >> "$LAN_ALLOW_FILE"
+    chmod 600 "$LAN_ALLOW_FILE"
+
+    nft_add_port "lan_allow_${proto}" "$port"
+    write_nft_structural
+    success "Порт ${port}/${proto} разрешён для LAN."
+}
+
+lan_allow_remove_interactive(){
+    header "НАСТРОЙКИ · СЕТЬ · FIREWALL · ДОСТУП С LAN · ЗАПРЕТИТЬ ПОРТ"
+    lan_allow_print_table
+    [[ -s "$LAN_ALLOW_FILE" ]] || return 0
+    echo
+    local n; read -rp "Номер правила для удаления (0 — отмена): " n || return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || { error "Введите число."; return 0; }
+    (( n == 0 )) && return 0
+    local total; total=$(lan_allow_count)
+    (( n >= 1 && n <= total )) || { error "Нет правила №${n}."; return 0; }
+
+    local entry proto port; entry=$(sed -n "${n}p" "$LAN_ALLOW_FILE"); read -r proto port _ <<<"$entry"
+    warn "Порт будет ЗАКРЫТ для доступа из LAN: ${entry}"
+    confirm "Точно запретить этот порт для LAN?" || return 0
+
+    # Removing LAN access can lock out the admin's own LAN session too —
+    # protected by the same inline confirm-or-rollback.
+    nft_snapshot
+    local tmp; tmp=$(mktemp "${STATE_DIR}/.lanallow.XXXXXX")
+    sed "${n}d" "$LAN_ALLOW_FILE" > "$tmp" && mv "$tmp" "$LAN_ALLOW_FILE"
+    chmod 600 "$LAN_ALLOW_FILE"
+
+    nft_del_port "lan_allow_${proto}" "$port"
+    write_nft_structural
+
+    if nft_confirm_or_rollback; then
+        success "Порт запрещён для LAN."
+    else
+        printf '%s\n' "$entry" >> "$LAN_ALLOW_FILE"
+        chmod 600 "$LAN_ALLOW_FILE"
+        write_nft_structural
+        error "Изменение отменено — порт остаётся разрешён для LAN."
     fi
 }
 
@@ -2437,7 +2860,7 @@ services_menu(){
                        && restart_stack
                else error "Стек не установлен."; fi ;;
             4) systemctl restart dnsmasq && success "dnsmasq перезапущен." || error "Ошибка dnsmasq."
-               write_nftables
+               write_nft_structural
                systemctl restart nftables && success "nftables перезапущен, правила пересозданы." || error "Ошибка nftables." ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
@@ -2613,52 +3036,51 @@ firewall_menu(){
             echo -e "  NAT: ${YELLOW}ВЫКЛЮЧЕН${NC}"
         fi
         echo
-        echo -e "${BOLD}ВХОДЯЩИЙ ТРАФИК — интернет → WAN${NC}"
-        local ssh_state="разрешён"
-        grep -qE '^tcp 22 ' "$WANACCESS_FILE" 2>/dev/null && ssh_state="заблокирован"
-        echo "  Доступ к gateway:      $(wanaccess_count) портов заблокировано (SSH: ${ssh_state})"
-        echo "  Проброс портов на LAN: $(portfwd_count) правил(о)"
+        echo -e "${BOLD}ДОСТУП К GATEWAY — default-deny, разрешены только явно указанные порты${NC}"
+        echo "  С LAN: $(lan_allow_count) портов разрешено"
+        echo "  С WAN: $(wanaccess_count) портов разрешено"
+        echo "  Проброс портов на LAN (DNAT): $(portfwd_count) правил(о)"
         if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
             echo
             echo -e "${YELLOW}Внимание: UFW тоже активен — возможен конфликт правил.${NC}"
         fi
         echo
-        menu_item 1 "Включить / выключить firewall"  "полностью отключает фильтрацию и NAT"
-        menu_item 2 "NAT — доступ LAN в интернет"     "включить/выключить общий доступ в сеть"
-        menu_item 3 "Доступ к gateway с WAN"           "какие порты gateway видны снаружи (SSH и др.)"
-        menu_item 4 "Проброс портов на устройства LAN" "сделать устройство LAN доступным из интернета"
+        menu_item 1 "Включить / выключить firewall"    "полностью отключает фильтрацию и NAT"
+        menu_item 2 "NAT — доступ LAN в интернет"       "включить/выключить общий доступ в сеть"
+        menu_item 3 "Доступ к gateway с WAN"            "allow-list: какие порты видны снаружи"
+        menu_item 4 "Доступ к gateway с LAN"            "allow-list: какие порты видны из LAN"
+        menu_item 5 "Проброс портов на устройства LAN"  "сделать устройство LAN доступным из интернета"
         menu_item 0 "Назад" ""
         echo
-        local c; read -rp "Выбор [0-4]: " c || return 0
+        local c; read -rp "Выбор [0-5]: " c || return 0
         case "$c" in
             1)
                 if systemctl is-active --quiet nftables 2>/dev/null; then
-                    warn "Выключение firewall уберёт и фильтрацию, и NAT — LAN может потерять доступ в интернет."
+                    warn "Выключение firewall уберёт и фильтрацию, и NAT — LAN и WAN потеряют защиту default-deny."
                     if confirm "Выключить firewall?"; then
                         systemctl disable --now nftables >/dev/null 2>&1 \
                             && success "Firewall выключен." || error "Не удалось выключить firewall."
                     fi
                 else
-                    write_nftables
-                    if systemctl enable --now nftables >/dev/null 2>&1; then
-                        success "Firewall включён."
-                    else
-                        error "Не удалось включить firewall."
-                    fi
+                    nft_snapshot
+                    write_nft_structural
+                    nft_apply_with_confirm || error "Не удалось включить firewall."
                 fi ;;
             2)
                 local old="$NAT_ENABLED"
                 [[ "$NAT_ENABLED" == 1 ]] && NAT_ENABLED=0 || NAT_ENABLED=1
-                write_nftables
-                if reload_nftables; then
+                nft_snapshot
+                write_nft_structural
+                if nft_apply_with_confirm; then
                     write_config
                     [[ "$NAT_ENABLED" == 1 ]] && success "NAT включён." || success "NAT выключен."
                 else
-                    NAT_ENABLED="$old"; write_nftables; reload_nftables || true
-                    error "Не удалось изменить NAT."
+                    NAT_ENABLED="$old"; write_nft_structural
+                    error "Изменение NAT отменено."
                 fi ;;
             3) wanaccess_menu; continue ;;
-            4) portfwd_menu; continue ;;
+            4) lan_allow_menu; continue ;;
+            5) portfwd_menu; continue ;;
             0) return 0 ;;
             *) warn "Неверный выбор."; continue ;;
         esac
