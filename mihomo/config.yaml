@@ -1,25 +1,58 @@
+# ============================================================================
+# ОСНОВНЫЕ ПАРАМЕТРЫ
+# ============================================================================
+
+# Смешанный прокси (HTTP + SOCKS5) на порту 7890
 mixed-port: 7890
+
+# Разрешить подключения из локальной сети (например, с других устройств дома)
+# Если true — другие устройства в вашей сети смогут использовать этот прокси
 allow-lan: true
+
+# Адрес, к которому привязывается слушатель. "*" — все интерфейсы
 bind-address: "*"
 
+# Режим работы ядра: определяет логику маршрутизации всего трафика
+# "rule" — трафик распределяется по правилам (рекомендуется для гибкости)
 mode: rule
+
+# Уровень подробности логирования событий в журнале работы
+# Доступные значения: silent (тихо), error (ошибки), warning (предупреждения),
+# info (информация), debug (отладка - максимальная детализация)
 log-level: info
+
+# Включить поддержку IPv6
 ipv6: false
 
+# Адрес и порт для управления через веб-интерфейс (например: 0.0.0.0:9090)
+# 0.0.0.0 — слушать все сетевые интерфейсы (доступ из сети)
 external-controller: "0.0.0.0:9090"
+
+# Секретный ключ для защиты доступа к веб-панели (API Secret)
+# Рекомендуется использовать сложную строку для безопасности
+# Без этого ключа любой в локальной сети сможет управлять прокси
 secret: "__CLASH_SECRET__"
 
+# Настройки CORS для внешнего контроллера
 external-controller-cors:
+  # Разрешённые источники (origins) для доступа к API
   allow-origins:
     - "http://__LAN_IP__"
+  # Разрешить доступ из частных сетей
   allow-private-network: true
 
+# ============================================================================
+# ПОДПИСКИ НА ПРОКСИ (PROXY PROVIDERS)
+# ============================================================================
+
+# Источники прокси-серверов (подписки)
 proxy-providers:
   subscription:
     type: http
     url: "__SUBSCRIPTION_URL__"
     path: ./proxy_providers/subscription.yaml
     interval: 3600
+    # Проверка здоровья прокси (health check)
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204
@@ -27,7 +60,17 @@ proxy-providers:
       timeout: 5000
       expected-status: 204
 
+# ============================================================================
+# ГРУППЫ ПРОКСИ (PROXY GROUPS)
+# ============================================================================
+
+# Группы определяют логику выбора прокси для различных сценариев
+# Типы групп: select (ручной), url-test (автоматический по скорости), fallback (резервный)
 proxy-groups:
+  # AUTO — автоматический выбор по скорости (url-test)
+  # include-all: true — включить все доступные прокси
+  # exclude-type: direct — исключить прямое подключение
+  # exclude-filter — исключить прокси с названиями, содержащими "авто", "auto" и т.п.
   - name: AUTO
     type: url-test
     include-all: true
@@ -38,6 +81,7 @@ proxy-groups:
     tolerance: 150
     empty-fallback: COMPATIBLE
 
+  # PROXY — ручной выбор между AUTO и DIRECT
   - name: PROXY
     type: select
     proxies:
@@ -45,9 +89,15 @@ proxy-groups:
       - DIRECT
     default-selected: AUTO
 
+# ============================================================================
+# TUN (ВИРТУАЛЬНЫЙ СЕТЕВОЙ ИНТЕРФЕЙС)
+# ============================================================================
+
 tun:
   enable: true
+  # Стек: system — использовать системный стек
   stack: system
+  # Автоматическая маршрутизация трафика через TUN
   auto-route: true
   # Required for this box's actual role: it's a gateway proxying OTHER LAN
   # devices' traffic, not just its own. auto-route alone (via ip routes/
@@ -57,32 +107,53 @@ tun:
   # forwarded traffic gets pulled into the TUN and silently dropped instead
   # of being proxied or passed through DIRECT.
   auto-redirect: true
+  # Автоматически определять интерфейс для TUN
   auto-detect-interface: true
+  # Исключить из маршрутизации через TUN указанные адреса
   route-exclude-address:
     - __LAN_NETWORK__
     - 192.168.1.0/24
     - 1.1.1.1/32
     - 8.8.8.8/32
 
+# ============================================================================
+# АНАЛИЗ ТРАФИКА (SNIFFER)
+# ============================================================================
+
+# Функция "подслушивания" трафика для определения доменных имён
+# Позволяет корректно маршрутизировать трафик даже при подключении по IP-адресу
+# Критически важно для работы правил на основе доменных имён
 sniffer:
   enable: true
+  # Настройки для различных протоколов
   sniff:
     HTTP:
       ports: [80, 8080-8880]
+      # Подменять получателя трафика на домен
       override-destination: true
     TLS:
       ports: [443, 8443]
     QUIC:
       ports: [443, 8443]
 
+# ============================================================================
+# ВНЕШНИЕ НАБОРЫ ПРАВИЛ (RULE PROVIDERS)
+# ============================================================================
+
+# Провайдеры правил — загружают списки доменов и IP для маршрутизации
+# Позволяют автоматически обновлять правила без изменения конфигурации
 rule-providers:
   youtube:
     type: http
+    # Тип правила: домены
     behavior: domain
+    # Формат: Meta Ruleset
     format: mrs
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/youtube.mrs"
     path: ./ruleset/youtube.mrs
+    # Интервал обновления: 24 часа
     interval: 86400
+
   discord:
     type: http
     behavior: domain
@@ -90,13 +161,16 @@ rule-providers:
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord.mrs"
     path: ./ruleset/discord.mrs
     interval: 86400
+
   discord-ip:
     type: http
+    # Тип правила: IP-диапазоны
     behavior: ipcidr
     format: mrs
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/discord-ip.mrs"
     path: ./ruleset/discord-ip.mrs
     interval: 86400
+
   telegram:
     type: http
     behavior: domain
@@ -104,6 +178,7 @@ rule-providers:
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram.mrs"
     path: ./ruleset/telegram.mrs
     interval: 86400
+
   telegram-ip:
     type: http
     behavior: ipcidr
@@ -111,6 +186,7 @@ rule-providers:
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/telegram-ip.mrs"
     path: ./ruleset/telegram-ip.mrs
     interval: 86400
+
   ai:
     type: http
     behavior: domain
@@ -118,6 +194,7 @@ rule-providers:
     url: "https://cdn.jsdelivr.net/gh/mvrvntn/routing@release/mihomo/ai.mrs"
     path: ./ruleset/ai.mrs
     interval: 86400
+
   category-geoblock-ru:
     type: http
     behavior: domain
@@ -126,6 +203,12 @@ rule-providers:
     path: ./ruleset/category-geoblock-ru.mrs
     interval: 86400
 
+# ============================================================================
+# ПРАВИЛА МАРШРУТИЗАЦИИ (RULES)
+# ============================================================================
+
+# Основной список правил маршрутизации
+# Правила обрабатываются сверху вниз, первое совпадение применяется
 rules:
   - RULE-SET,youtube,PROXY
   - RULE-SET,discord,PROXY
@@ -134,4 +217,5 @@ rules:
   - RULE-SET,telegram-ip,PROXY,no-resolve
   - RULE-SET,ai,PROXY
   - RULE-SET,category-geoblock-ru,PROXY
+  # Правило по умолчанию — весь остальной трафик
   - MATCH,DIRECT
